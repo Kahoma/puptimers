@@ -13,7 +13,7 @@
 
 addon.name    = 'puptimers';
 addon.author  = 'Kahoma';
-addon.version = '1.0.0';
+addon.version = '1.1.0';
 addon.desc    = 'Puppetmaster helper: automaton ability cooldowns, maneuvers and PUP recasts.';
 addon.link    = 'https://github.com/Kahoma/puptimers';
 
@@ -25,6 +25,8 @@ local core     = require('pt_core');
 local ov       = require('pt_overload');
 local gear     = require('pt_gear');
 local ui       = require('pt_ui');
+local profiles = require('pt_profiles');
+local setup    = require('pt_setup');
 
 local POLL_INTERVAL = 0.1;   -- seconds between reads of buffs / recasts / pet
 local SAVE_DELAY    = 1.0;   -- seconds to wait after the last change before writing settings
@@ -36,6 +38,8 @@ local pt = {
     ov       = ov.new(),           -- overload / burden estimator
     ov_last  = nil,                -- { el, time } last maneuver fed to the estimator (dedupe)
     gear     = { thresh = 0, suppress = false, items = {}, wearing = {}, checked_at = -100 },
+    setup    = setup.new(),        -- the automaton's head, frame, attachments, HP/MP and stats (packet 0x044)
+    kit      = { known = false },  -- what the setup means for PupTimers (rebuilt when the setup changes)
     game     = {
         logged_in       = false,
         is_pup          = false,
@@ -59,6 +63,10 @@ local pt = {
     sounds       = nil,
     sounds_at    = -100,
     errors_at    = {},
+    error_counts = {},     -- part -> errors this session
+    stopped      = {},     -- part -> true when switched off after repeated errors
+    last_error   = nil,
+    load_msg     = true,   -- the "window is unlocked" hint, shown once on PUP
 };
 
 ----------------------------------------------------------------------------------------------------
@@ -73,11 +81,26 @@ local function sanitize(cfg)
             cfg[section] = dv;
         end
     end
-    for _, section in ipairs({ 'hud', 'colors', 'names', 'detect', 'maneuvers', 'overload', 'alerts', 'behavior' }) do
+    for _, section in ipairs({ 'hud', 'colors', 'names', 'detect', 'maneuvers', 'overload', 'alerts', 'behavior', 'profiles', 'automaton' }) do
         for k, v in pairs(d[section]) do
             if (type(cfg[section][k]) ~= type(v)) then
                 cfg[section][k] = v;
             end
+        end
+    end
+    local tm = cfg.maneuvers.timer_mode;
+    if (tm ~= 'auto' and tm ~= 'game' and tm ~= 'flat') then
+        cfg.maneuvers.timer_mode = 'auto';
+    end
+    if (cfg.hud.grow ~= 'down' and cfg.hud.grow ~= 'up') then
+        cfg.hud.grow = 'down';
+    end
+    if (type(cfg.profiles.frames) ~= 'table') then
+        cfg.profiles.frames = d.profiles.frames;
+    end
+    for k, v in pairs(d.profiles.frames) do
+        if (type(cfg.profiles.frames[k]) ~= 'string') then
+            cfg.profiles.frames[k] = v;
         end
     end
     for k, v in pairs(d.maneuvers.colors) do
@@ -131,6 +154,32 @@ local function sanitize(cfg)
                 end
             end
         end
+    end
+end
+
+-- One-time changes for settings saved by an older version (settings.version).
+local function migrate(cfg)
+    local v = tonumber(rawget(cfg, 'version')) or 1;
+    if (v < 2) then
+        -- 1.0 had a "use the game's buff timers for every maneuver" checkbox; 1.1 has auto / game / flat.
+        local m = rawget(cfg, 'maneuvers');
+        if (type(m) == 'table') then
+            if (rawget(m, 'real_timers') == true) then
+                m.timer_mode = 'game';
+            end
+            m.real_timers = nil;
+        end
+        -- Current server code: automatons start at 35 burden (was 30), Reactive Shield 60s (was 65).
+        local o = rawget(cfg, 'overload');
+        if (type(o) == 'table' and rawget(o, 'spawn_burden') == 30) then
+            o.spawn_burden = 35;
+        end
+        local ab = rawget(cfg, 'abilities');
+        local rs = (type(ab) == 'table') and rawget(ab, 'reactive_shield') or nil;
+        if (type(rs) == 'table' and rs.cooldown == 65) then
+            rs.cooldown = 60;
+        end
+        cfg.version = 2;
     end
 end
 
@@ -189,6 +238,7 @@ end
 pt.settings = load_settings();
 pt.settings_folder = current_settings_folder();   -- the folder the settings in use came from
 unshare(pt.settings, DEFAULTS);
+migrate(pt.settings);
 sanitize(pt.settings);
 
 --[[
@@ -353,6 +403,10 @@ local function start_ability(key, source, now)
     if (info == nil) then
         return false;
     end
+    if (source == 'packet' or source == 'chat') then
+        -- For explaining maneuvers it used up, even when its bar is turned off.
+        pt.last_pet_ability, pt.last_pet_ability_at = key, now;
+    end
     if (info.enabled == false) then
         debug(('%s seen (%s) but it is turned off in settings.'):format(info.name, source));
         return false;
@@ -379,7 +433,7 @@ end
 -- Overload estimator plumbing
 ----------------------------------------------------------------------------------------------------
 
--- Heatsink (Water attachment) burden decay by active Water Maneuvers (LandSandBoat 2021-2023).
+-- Heatsink extra burden decay by active Water Maneuvers on older server code (the "by Water" option).
 local HEATSINK_DECAY = { [0] = 2, 4, 5, 6 };
 
 local function overload_params(out)
@@ -387,18 +441,25 @@ local function overload_params(out)
     local thresh, decay, suppress = 0, 0, false;
     thresh = thresh + (pt.gear.thresh or 0);
     suppress = (pt.gear.suppress == true);
-    if (o.heatsink) then
-        local water = 0;
-        for _, m in ipairs(pt.state.man.list) do
-            if (m.el == 6) then
-                water = water + 1;
+    local heatsink = o.heatsink;
+    if (o.attachments_auto and pt.kit.known) then
+        heatsink = pt.kit.heatsink;   -- as the game reports it
+    end
+    if (heatsink) then
+        if (o.heatsink_by_water) then
+            local water = 0;
+            for _, m in ipairs(pt.state.man.list) do
+                if (m.el == 6) then
+                    water = water + 1;
+                end
             end
+            decay = decay + (HEATSINK_DECAY[math.min(water, 3)] or 2);
+        else
+            decay = decay + (tonumber(o.heatsink_decay) or 1);
         end
-        decay = decay + (HEATSINK_DECAY[math.min(water, 3)] or 2);
     end
-    if (o.tactical_processor) then
-        thresh = thresh - 5;
-    end
+    -- Tactical Processor: this era's server code gives it -5 overload threshold, but on the
+    -- automaton, and the overload check only reads your own threshold, so it changes nothing.
     thresh = thresh + (tonumber(o.extra_threshold) or 0);
     decay = decay + (tonumber(o.extra_decay) or 0);
     return ov.params(pt.settings, thresh, decay, suppress, pt.state.man.overdrive == true, out);
@@ -411,7 +472,95 @@ end
 
 -- One maneuver can be reported by the action packet, the chat log and the recast timer; the estimator
 -- must count it once, but use the overload chance from whichever source carries it.
+----------------------------------------------------------------------------------------------------
+-- Burden of a maneuver from stats
+--
+-- The server works out how much burden a maneuver adds from your stat for that element against
+-- the automaton's (Dark: from the frame, or your MP against its MP, depending on the server code).
+-- The automaton's stats come with every setup packet; yours sit in memory from packet 0x061, which
+-- the server does not send again when your gear or buffs change, so they are only used while
+-- neither has changed since. Both server rules are tried, and one is used only once it has matched
+-- the game's own overload reports (ov.best_rule).
+----------------------------------------------------------------------------------------------------
+
+local STAT_OF = { 1, 5, 4, 3, 2, 6, 7 };   -- element -> stat (1 STR 2 DEX 3 VIT 4 AGI 5 INT 6 MND 7 CHR)
+
+local function gear_print()
+    local h = 0;
+    local inv = AshitaCore:GetMemoryManager():GetInventory();
+    if (inv == nil) then
+        return 0;
+    end
+    for slot = 0, 15 do
+        local eq = inv:GetEquippedItem(slot);
+        local packed = eq and eq.Index or 0;
+        local id = 0;
+        if (packed ~= nil and packed ~= 0) then
+            local item = inv:GetContainerItem(bit.rshift(bit.band(packed, 0xFF00), 8), bit.band(packed, 0xFF));
+            id = (item ~= nil and tonumber(item.Id)) or 0;
+        end
+        h = (h * 31 + id + slot) % 2147483647;
+    end
+    return h;
+end
+
+-- Packet 0x061: your stats as the server sends them. Remember what you wore and which buffs were up.
+local COUNTS_61 = {};
+local function on_stats_packet(e)
+    if (not pt.game.is_pup) then
+        return;
+    end
+    pt.stats_at = os.clock();
+    pt.stats_gear = gear_print();
+    local player = AshitaCore:GetMemoryManager():GetPlayer();
+    local _, _, _, bp = core.count_maneuvers(player and player:GetBuffs() or nil, COUNTS_61);
+    pt.stats_buffs = bp;
+end
+
+-- True while your stats in memory still match what you wear and your buffs.
+local function stats_fresh(gear_now)
+    return pt.stats_at ~= nil and pt.buffs_print == pt.stats_buffs and (gear_now or pt.gear_print) == pt.stats_gear;
+end
+
+function pt.stats_fresh()
+    return stats_fresh();
+end
+
+-- The burden a maneuver of element e would add now, by the two server rules (nil if not known).
+local function predict_burden(e, p, fresh)
+    local st = pt.setup;
+    if (not pt.settings.overload.use_stats or not st.known) then
+        return nil, nil;
+    end
+    local era, classic;
+    if (e == 8) then
+        era = (st.frame == 0x21 or st.frame == 0x22) and 8 or 14;   -- Valoredge / Sharpshot
+        local ok, mp = pcall(function () return AshitaCore:GetMemoryManager():GetParty():GetMemberMP(0); end);
+        if (ok and type(mp) == 'number') then
+            classic = (mp < st.mp) and 15 or 10;
+        end
+    else
+        if (not fresh) then
+            return nil, nil;
+        end
+        local player = AshitaCore:GetMemoryManager():GetPlayer();
+        local i = STAT_OF[e];
+        local mine = (tonumber(player:GetStat(i - 1)) or 0) + (tonumber(player:GetStatModifier(i - 1)) or 0);
+        local diff = mine - setup.stat(st, i);
+        era = (diff >= 4) and 14 or ((diff >= 0) and (19 - diff) or 20);
+        classic = (diff < 0) and 20 or 15;
+    end
+    if (p.suppress) then
+        era = era and math.floor(era / 3);              -- Kenkonken
+        classic = classic and math.floor(classic / 3);
+    end
+    return era, classic;
+end
+
 local function feed_overload(el, now, report, source)
+    if (not pt.settings.overload.enabled) then
+        return;   -- estimate switched off: no burden tracking and no risk warnings
+    end
     local p = pt.overload_params();
     if (report ~= nil and type(report.chance) == 'number' and report.chance > 0) then
         p = ov.after_overdrive(p);   -- a chance above 0% means Overdrive is over (see ov.on_report)
@@ -427,7 +576,13 @@ local function feed_overload(el, now, report, source)
         return;
     end
     pt.ov_last = { el = el, time = now, reported = (report ~= nil), chance = report and report.chance or nil };
-    ov.on_maneuver(pt.ov, el, now, p, report);
+    local era, classic = predict_burden(el, p, stats_fresh(gear_print()));
+    if (pt.burden_rule ~= nil) then
+        -- The burden this maneuver adds comes from the stats as worn right now (the per-second
+        -- prediction may predate a gear swap made for this maneuver); nil = use the learned value.
+        pt.ov.el[el].pred = (pt.burden_rule == 'era') and era or classic;
+    end
+    ov.on_maneuver(pt.ov, el, now, p, report, era, classic);
     if (report ~= nil) then
         debug(('Overload chance %s: %d%%%s [%s]'):format(data.elements[el].name, report.chance, report.overloaded and ' (OVERLOADED)' or '', source));
     end
@@ -448,7 +603,7 @@ local function handle_event(ev, source, now)
         if (source == 'packet') then
             pt.packet_seen[ev.key] = true;
         elseif (source == 'chat' and pt.packet_seen[ev.key] and pt.settings.detect.packets and
-                (pt.game.pet_id ~= 0 or not pt.game.pet_present)) then
+                not pt.stopped.actions and (pt.game.pet_id ~= 0 or not pt.game.pet_present)) then
             -- The packets already report this ability for our automaton, picked out by its id. The
             -- chat line adds nothing and may come from another automaton with the same name (always
             -- the case while ours is not out).
@@ -456,6 +611,7 @@ local function handle_event(ev, source, now)
         end
         start_ability(ev.key, source, now);
     elseif (ev.kind == 'maneuver') then
+        pt.man_used_at = now;
         if (core.maneuver_use(pt.state, ev.element, now)) then
             debug(('%s Maneuver used [%s].'):format(data.elements[ev.element].name, source));
         end
@@ -540,7 +696,7 @@ local function read_recasts(rc, out)
     return out;
 end
 
-local function on_pet_spawn(now)
+local function on_pet_spawn(now, activated)
     local started = {};
     for _, info in ipairs(core.all_abilities(pt.settings)) do
         if (info.on_spawn and info.enabled ~= false) then
@@ -549,7 +705,8 @@ local function on_pet_spawn(now)
             end
         end
     end
-    debug(('Automaton activated: %s.%s'):format(pt.game.pet_name or '?', (#started > 0) and (' Started: ' .. table.concat(started, ', ')) or ''));
+    debug(('%s: %s.%s'):format(activated and 'Automaton activated' or 'Automaton re-created after zoning', pt.game.pet_name or '?',
+        (#started > 0) and (' Started: ' .. table.concat(started, ', ')) or ''));
 end
 
 --[[
@@ -565,17 +722,19 @@ local function automaton_spawned(now, activated)
     end
     pt.spawned_at = now;
     pt.spawn_pending = nil;
-    -- The server builds a brand-new automaton every time (Activate, Deus Ex Automata, zoning), with
-    -- every ability ready, so the old automaton's cooldown bars no longer apply.
+    -- The server builds a brand-new automaton every time (Activate, Deus Ex Automata, zoning), so
+    -- the old automaton's cooldown bars no longer apply. Newer server code puts its abilities on
+    -- cooldown as it is built, zoning included: the abilities ticked "On act." start here.
     if (pt.settings.behavior.reset_on_despawn) then
         core.clear_timers(pt.state);
     end
-    if (activated) then
-        on_pet_spawn(now);
-    else
+    if (not activated) then
         debug('Zoned: overload estimate and ability timers reset for the re-created automaton.');
     end
-    ov.on_spawn(pt.ov, now, pt.overload_params());
+    on_pet_spawn(now, activated);
+    if (pt.settings.overload.enabled) then
+        ov.on_spawn(pt.ov, now, pt.overload_params());
+    end
 end
 
 -- Zoning (or logged out). Remember whether an automaton was out: only then does the server
@@ -585,6 +744,218 @@ local function mark_zoning()
         pt.zoned = true;
         pt.zone_had_pet = (pt.state.pet.present == true);
     end
+end
+
+--[[
+* Maneuvers that went before their time without a new one replacing them: an attachment used them
+* up (the game shows no message for that). Says which one when the cause is clear.
+--]]
+local USED_N = {};
+-- 'a' or 'an' for an element name (an Earth Maneuver, an Ice Maneuver).
+local function article(word)
+    return word:find('^[AEIOU]') and 'an' or 'a';
+end
+
+-- "a Fire Maneuver, an Earth Maneuver and 2 Light Maneuvers"
+local function join_and(parts)
+    if (#parts <= 1) then
+        return parts[1] or '';
+    end
+    return table.concat(parts, ', ', 1, #parts - 1) .. ' and ' .. parts[#parts];
+end
+
+local function used_text(e)
+    local n, el = USED_N[e], data.elements[e].name;
+    return (n == 1) and ('%s %s Maneuver'):format(article(el), el) or ('%d %s Maneuvers'):format(n, el);
+end
+
+-- Flame Holder takes its Fire Maneuvers when the weapon skill's animation ends (up to 3.5 s after
+-- its action packet); Ice Maker takes Ice Maneuvers as the spell lands.
+local WS_WINDOW, NUKE_WINDOW = 5.0, 5.0;
+
+local function explain_used_up(removed, now, duration, pet_alive)
+    for e = 1, 8 do
+        USED_N[e] = 0;
+    end
+    local total = 0;
+    for _, r in ipairs(removed) do
+        -- Only maneuvers known to have gone early. One that was already up when PupTimers loaded has
+        -- no known end until the game sends its timer, so it cannot be told apart from running out.
+        local ends = r.ends or ((not r.unknown) and (r.start + duration) or nil);
+        if (not r.replaced and ends ~= nil and now < ends - 3) then
+            USED_N[r.el] = USED_N[r.el] + 1;
+            total = total + 1;
+        end
+    end
+    if (total == 0) then
+        return;
+    end
+    local a = nil;
+    if ((now - (pt.last_pet_ability_at or -100)) <= 3) then
+        a = core.ability_def[pt.last_pet_ability or ''];
+    end
+    -- Eraser uses up every maneuver on this era's server code (older code: only Light ones), so
+    -- whatever went right after it is its doing.
+    if (a ~= nil and a.consumes == 'all') then
+        local parts = {};
+        for e = 1, 8 do
+            if (USED_N[e] > 0) then
+                parts[#parts + 1] = used_text(e);
+            end
+        end
+        msg(('%s used up %s.'):format(a.name, join_and(parts)));
+        return;
+    end
+    local kit = pt.kit;
+    -- Flame Holder fires on the automaton's weapon skills, Ice Maker on its elemental nukes.
+    local weapon_skill = (now - (pt.pet_ws_at or -100)) <= WS_WINDOW;
+    local nuke = (now - (pt.pet_nuke_at or -100)) <= NUKE_WINDOW;
+    local alive = pet_alive and kit.known;
+    for e = 1, 8 do
+        if (USED_N[e] > 0) then
+            local what = used_text(e);
+            local text = nil;
+            if (a ~= nil and a.consumes and a.element == data.elements[e].key) then
+                text = ('%s used up %s.'):format(a.name, what);
+            elseif (alive and e == 1 and kit.flame_holder and weapon_skill) then
+                text = ('Flame Holder used %s for the automaton\'s weapon skill.'):format(what);
+            elseif (alive and e == 2 and kit.ice_maker and nuke) then
+                text = ('Ice Maker used %s for the automaton\'s spell.'):format(what);
+            elseif (alive and #pt.state.man.list > 0) then
+                -- Not everything went (so not a KO, Deactivate or overload).
+                if (e == 6 and kit.condenser and (now - (pt.man_used_at or -100)) <= 3) then
+                    text = ('Condenser used %s to stop an overload.'):format(what);
+                elseif (e == 4 and kit.schurzen) then
+                    text = ('Schurzen used %s to save your automaton from a fatal hit.'):format(what);
+                end
+            end
+            if (text ~= nil) then
+                msg(text);
+            else
+                debug(('%s went early (no maneuver replaced it).'):format(what));
+            end
+        end
+    end
+end
+
+--[[
+* Equipped automaton abilities that cannot fire because no maneuver of their element is up (and that
+* are not cooling down anyway). The text is rebuilt only when that set changes.
+--]]
+local function update_unpowered(counts, now, lost_maneuver, pet_alive)
+    local g = pt.game;
+    local cfg = pt.settings;
+    local show, warn = cfg.maneuvers.show_unpowered == true, cfg.maneuvers.alert_unpowered == true;
+    local key = 0;
+    -- Only while the automaton is really there and alive: Deactivate, a KO and zoning take every
+    -- maneuver at once, and that is not "an ability left unpowered".
+    if (pt.kit.known and pet_alive and (show or warn)) then
+        for i, a in ipairs(data.abilities) do
+            if (a.element ~= nil and pt.kit.abilities[a.key]) then
+                local s = cfg.abilities[a.key];
+                local t = pt.state.timers[a.key];
+                if (s ~= nil and s.enabled ~= false and counts[data.element_index[a.element]] == 0 and (t == nil or t.ready)) then
+                    key = key + 2 ^ (i - 1);
+                end
+            end
+        end
+    end
+    if (key == pt.unpowered_key and show == pt.unpowered_show) then
+        return;
+    end
+    local before = pt.unpowered_key or 0;
+    pt.unpowered_key, pt.unpowered_show = key, show;
+    g.unpowered_text, g.unpowered_short = nil, nil;
+    if (key == 0) then
+        return;
+    end
+    local parts, newly = {}, {};
+    for i, a in ipairs(data.abilities) do
+        local bit_i = 2 ^ (i - 1);
+        if (key % (2 * bit_i) >= bit_i) then
+            local el = data.elements[data.element_index[a.element]].name;
+            parts[#parts + 1] = ('%s (%s)'):format(a.name, el);
+            if (before % (2 * bit_i) < bit_i) then
+                newly[#newly + 1] = ('%s needs %s %s Maneuver'):format(a.name, article(el), el);
+            end
+        end
+    end
+    if (show) then
+        g.unpowered_text = 'Unpowered: ' .. table.concat(parts, ', ');
+        g.unpowered_short = ('Unpowered (%d)'):format(#parts);
+    end
+    if (lost_maneuver and warn and #newly > 0) then
+        alert(table.concat(newly, '; ') .. '.', true);
+    end
+end
+
+--[[
+* Automaton Oil: the stack in the ammo slot (what Repair uses, one per use) and how many more the
+* inventory holds. The inventory is only scanned again when the game says it changed.
+--]]
+local OIL = { id = nil, count = 0, more = 0, counter = false, ec = nil, es = nil };
+
+-- Forgets the oil seen (another character, or PUP left): nothing to compare the next reading with.
+local function reset_oil()
+    OIL.id, OIL.count, OIL.more, OIL.counter, OIL.label, OIL.ec, OIL.es = nil, 0, 0, false, nil, nil, nil;
+end
+
+local function read_oil()
+    local inv = AshitaCore:GetMemoryManager():GetInventory();
+    if (inv == nil) then
+        return;
+    end
+    local id, count, ec, es = nil, 0, -1, -1;
+    local eq = inv:GetEquippedItem(3);   -- ammo slot
+    local packed = eq and eq.Index or 0;
+    if (packed ~= nil and packed ~= 0) then
+        ec, es = bit.rshift(bit.band(packed, 0xFF00), 8), bit.band(packed, 0xFF);
+        local item = inv:GetContainerItem(ec, es);
+        if (item ~= nil and data.oils[item.Id] ~= nil) then
+            id, count = item.Id, tonumber(item.Count) or 0;
+        end
+    end
+    local okc, counter = pcall(function () return inv:GetContainerUpdateCounter(); end);
+    if (not okc) then
+        counter = nil;
+    end
+    local more_before = OIL.more;
+    if (counter == nil or counter ~= OIL.counter or id ~= OIL.id) then
+        OIL.counter = counter;
+        local more = 0;
+        local max = math.min(tonumber(inv:GetContainerCountMax(0)) or 80, 80);
+        for slot = 1, max do
+            if (not (ec == 0 and es == slot)) then
+                local it = inv:GetContainerItem(0, slot);
+                if (it ~= nil and data.oils[it.Id] ~= nil) then
+                    more = more + (tonumber(it.Count) or 0);
+                end
+            end
+        end
+        OIL.more = more;
+    end
+    local was = OIL.count;
+    -- Oil equipped from a container other than the inventory (a wardrobe) stays there when taken off.
+    local kept = false;
+    if (was > 0 and id == nil and OIL.ec ~= nil and OIL.ec ~= 0) then
+        local it = inv:GetContainerItem(OIL.ec, OIL.es);
+        kept = (it ~= nil and data.oils[it.Id] ~= nil);
+    end
+    local changed = (id ~= OIL.id or count ~= OIL.count or OIL.more ~= more_before or OIL.label == nil);
+    OIL.id, OIL.count = id, count;
+    if (id ~= nil) then
+        OIL.ec, OIL.es = ec, es;
+    end
+    if (changed) then
+        local more = (OIL.more > 0) and (', %d more'):format(OIL.more) or '';
+        OIL.label = (id ~= nil) and ('Repair (%s x%d%s)'):format(data.oils[id], count, more) or 'Repair (no oil equipped)';
+        -- Used up, not taken off: an unequipped stack is back among the inventory's oil.
+        if (was > 0 and id == nil and not kept and OIL.more < more_before + was and pt.settings.automaton.oil and pt.game.is_pup) then
+            alert(('Out of Automaton Oil in your ammo slot%s.'):format((OIL.more > 0) and (' (%d more in your inventory)'):format(OIL.more) or ''), true);
+        end
+    end
+    pt.game.repair_label = pt.settings.automaton.oil and OIL.label or nil;
+    pt.game.oil_ready = (id ~= nil);
 end
 
 local function poll(now)
@@ -636,6 +1007,32 @@ local function poll(now)
         pt.chat_ctx = nil;
     end
     g.player_id = ent.ServerId or 0;
+    -- Status 4 is "in an event" (cutscene, talking to an NPC); the stock cleancs addon uses the same.
+    g.in_event = (ent.StatusServer == 4 or ent.Status == 4);
+
+    if (not g.is_pup) then
+        -- Not on Puppetmaster: forget what was tracked and read nothing more until PUP is back.
+        if (pt.was_pup) then
+            pt.was_pup = false;
+            pt.state = core.new_state();
+            pt.ov = ov.new();
+            pt.buff_ends, pt.buff_ends_at, pt.ov_last = nil, nil, nil;
+            pt.spawned_at, pt.spawn_pending = nil, nil;
+            pt.setup, pt.kit, pt.kit_frame = setup.new(), { known = false }, nil;
+            pt.stats_at = nil;
+            reset_oil();
+            g.pet_present, g.pet_id, g.pet_name = false, 0, nil;
+            g.maneuver_recast, g.maneuver_recast_at = 0, nil;
+        end
+        return;
+    end
+    pt.was_pup = true;
+    if (pt.load_msg) then
+        pt.load_msg = nil;
+        if (not pt.settings.hud.locked) then
+            msg('The timer window is unlocked: drag it into place, resize it from the corner, then type /pupt lock. /pupt opens settings.');
+        end
+    end
 
     -- Automaton --------------------------------------------------------------------------------
     local info = nil;
@@ -648,6 +1045,7 @@ local function poll(now)
                 if (type(name) == 'string' and name ~= '') then
                     PETINFO.name = name;
                     PETINFO.id = pet.ServerId or 0;
+                    PETINFO.hpp = pet.HPPercent;
                     info = PETINFO;
                 end
             end
@@ -661,6 +1059,13 @@ local function poll(now)
     g.pet_present = pt.state.pet.present;
     g.pet_name = pt.state.pet.name;
     g.pet_id = g.pet_present and (pt.state.pet.id or 0) or 0;
+    if (info ~= nil) then
+        g.pet_hpp = tonumber(info.hpp);
+        local okm, mpp = pcall(player.GetPetMPPercent, player);
+        g.pet_mpp = okm and tonumber(mpp) or nil;
+    else
+        g.pet_hpp, g.pet_mpp = nil, nil;
+    end
     if (info ~= nil and info.name ~= pt.settings.names.last_pet) then
         pt.settings.names.last_pet = info.name;
         pt.chat_ctx = nil;
@@ -698,6 +1103,8 @@ local function poll(now)
         local thresh, suppress, counted, wearing = gear.totals(ids, pt.settings);
         pt.gear.thresh, pt.gear.suppress, pt.gear.items, pt.gear.wearing = thresh, suppress, counted, wearing;
         ov.set_suppress(pt.ov, suppress);
+        pcall(read_oil);
+        pt.gear_print = gear_print();
     end
 
     -- Recasts ----------------------------------------------------------------------------------
@@ -708,7 +1115,8 @@ local function poll(now)
     core.maneuver_recast(pt.state, mr, now);
 
     -- Maneuvers (buff bar is the source of truth) ----------------------------------------------
-    local counts, overload, overdrive = core.count_maneuvers(player:GetBuffs(), COUNTS);
+    local counts, overload, overdrive, bprint = core.count_maneuvers(player:GetBuffs(), COUNTS);
+    pt.buffs_print = bprint;
     if (overload and not pt.state.man.overload) then
         debug('Overloaded!');
     elseif (not overload and pt.state.man.overload) then
@@ -717,11 +1125,36 @@ local function poll(now)
     pt.state.man.overload = overload;
     pt.state.man.overdrive = overdrive;
     local duration = tonumber(pt.settings.maneuvers.duration) or 60;
-    local removed = core.maneuver_sync(pt.state, counts, now, data.MAX_MANEUVERS, duration);
-    core.apply_buff_ends(pt.state, pt.buff_ends, now, not pt.settings.maneuvers.real_timers, pt.settings.maneuvers.duration);
+    local removed = core.maneuver_sync(pt.state, counts, now, data.MAX_MANEUVERS, duration, pt.clock_game and pt.buff_ends or nil);
+    -- Auto: maneuvers count from their use (exact, no clock needed) until one turns out to last
+    -- longer than the set duration (servers that lengthen them in long fights); from then on the
+    -- game's buff timers are used. With only the PC clock to go by, a maneuver that matched the
+    -- duration must have been seen first, so a PC clock that is off cannot fake a longer one.
+    local mode = pt.settings.maneuvers.timer_mode;
+    local seen = core.fresh_maneuver_length(pt.state, pt.buff_ends, pt.buff_ends_at, now);
+    if (seen ~= nil) then
+        if (math.abs(seen - duration) <= 3) then
+            pt.flat_seen = true;
+        elseif (seen > duration + 5 and seen <= 330) then
+            pt.long_seen = math.max(pt.long_seen or 0, seen);
+            if (mode == 'auto' and not pt.long_maneuvers and (pt.clock_game or pt.flat_seen)) then
+                pt.long_maneuvers = true;
+                msg(('A maneuver just got %ds instead of %ds, so maneuvers last longer in battle on this server: following the game\'s buff timers from now on.'):format(math.floor(seen + 0.5), duration));
+            end
+        end
+    end
+    local use_game = (mode == 'game') or (mode == 'auto' and pt.long_maneuvers == true);
+    core.apply_buff_ends(pt.state, pt.buff_ends, now, not use_game, duration);
     if (overload and pt.buff_ends ~= nil and pt.buff_ends.overload ~= nil) then
         pt.ov.overload_until = pt.buff_ends.overload;   -- exact, from the game's buff timer
     end
+    g.man_counts = counts;
+    local pet_alive = (info ~= nil and (g.pet_hpp or 0) > 0);
+    if (removed ~= nil and pt.settings.maneuvers.explain_used and not overload) then
+        explain_used_up(removed, now, duration, pet_alive);
+    end
+    -- An overload takes every maneuver at once: not "an ability left unpowered" either.
+    update_unpowered(counts, now, removed ~= nil and not overload, pet_alive);
     if (removed ~= nil and pt.settings.maneuvers.enabled and pt.settings.maneuvers.alert_wear and not overload) then
         for _, r in ipairs(removed) do
             -- Only maneuvers that ran out: not ones a new maneuver pushed out, and not ones that
@@ -737,10 +1170,33 @@ local function poll(now)
     -- When the cooling rate changes, the burden so far is fixed at the old rate first.
     local prev = pt.ov_params;
     local p_now = overload_params((prev == PARAMS[1]) and PARAMS[2] or PARAMS[1]);
-    if (prev ~= nil and prev.decay ~= p_now.decay) then
+    local ov_on = pt.settings.overload.enabled;
+    if (ov_on and pt.ov_off) then
+        -- Switched back on: nothing was tracked meanwhile, so the burden is unknown again.
+        pt.ov = ov.new();
+        if (g.pet_present) then
+            ov.mark_unknown(pt.ov, now);
+        end
+    elseif (ov_on and prev ~= nil and prev.decay ~= p_now.decay) then
         ov.rebase(pt.ov, now, prev);
     end
+    pt.ov_off = not ov_on;
     pt.ov_params = p_now;
+    -- The burden each element's next maneuver would add, by the stat rule the game has confirmed.
+    if (now >= (pt.pred_next or 0)) then
+        pt.pred_next = now + 1.0;
+        local rule = (ov_on and pt.settings.overload.use_stats) and ov.best_rule(pt.ov) or nil;
+        local fresh = stats_fresh();
+        for e = 1, 8 do
+            local pred = nil;
+            if (rule ~= nil) then
+                local era, classic = predict_burden(e, p_now, fresh);
+                pred = (rule == 'era') and era or classic;
+            end
+            pt.ov.el[e].pred = pred;
+        end
+        pt.burden_rule = rule;
+    end
 
     -- Job abilities ----------------------------------------------------------------------------
     local fired, started = core.update_job_abilities(pt.state, data.job_abilities, recasts, now, g.main_is_pup);
@@ -748,7 +1204,11 @@ local function poll(now)
         for _, def in ipairs(fired) do
             local opt = pt.settings.jobabilities[def.key];
             if (opt ~= nil and opt.alert and g.is_pup) then
-                alert(('%s is ready.'):format(def.name), true);
+                if (def.key == 'repair' and pt.settings.automaton.oil and not g.oil_ready) then
+                    alert('Repair is ready, but there is no Automaton Oil in your ammo slot.', true);
+                else
+                    alert(('%s is ready.'):format(def.name), true);
+                end
             end
         end
     end
@@ -759,6 +1219,57 @@ local function poll(now)
             if (def.spawns and (pt.spawned_at == nil or (now - pt.spawned_at) >= 3.0)) then
                 pt.spawn_pending = now;
             end
+        end
+    end
+
+    -- Puppetmaster marks on the HP / MP bars, rebuilt only when what they depend on changes:
+    -- where Economizer and Mana Converter fire for the Dark Maneuvers up, where Replicator fires.
+    local kit = pt.kit;
+    local dark, wind = counts[8], counts[3];
+    local mk, hk = 0, 0;
+    if (kit.known and g.pet_present) then
+        mk = ((kit.economizer and dark >= 1) and 1 or 0) + ((kit.mana_converter and dark >= 1) and 2 or 0) + dark * 4;
+        hk = ((kit.replicator and wind >= 1) and 1 or 0) + (kit.damage_gauge and 2 or 0);
+    end
+    if (mk ~= pt.mp_marks_key) then
+        pt.mp_marks_key = mk;
+        local marks = nil;
+        if (mk % 4 ~= 0) then
+            marks = {};
+            if (mk % 2 == 1) then
+                marks[#marks + 1] = (60 - 10 * dark) / 100;             -- Economizer: below 50/40/30%
+            end
+            if (mk % 4 >= 2) then
+                marks[#marks + 1] = ({ 40, 60, 65 })[math.min(dark, 3)] / 100;   -- Mana Converter
+            end
+        end
+        g.pet_mp_marks = marks;
+    end
+    if (hk ~= pt.hp_marks_key) then
+        pt.hp_marks_key = hk;
+        g.pet_hp_marks = (hk % 2 == 1) and { (hk >= 2) and 0.75 or 0.50 } or nil;   -- Replicator
+    end
+    -- Deactivate at exactly full HP resets the Activate recast: say so while Activate cools down.
+    local act = pt.state.ja.activate;
+    local st = pt.setup;
+    g.deactivate_hint = (pt.settings.automaton.deactivate_hint and kit.known and g.pet_present and
+        act ~= nil and act.active and st.max_hp > 0 and st.hp >= st.max_hp and (g.pet_hpp or 0) > 0) or nil;
+
+    -- Repair reminder: once each time the automaton's HP falls to the set % while Repair is ready.
+    local ra = tonumber(pt.settings.automaton.repair_at) or 0;
+    if (ra > 0 and g.pet_present and g.pet_hpp ~= nil) then
+        if (g.pet_hpp <= ra) then
+            local rep = pt.state.ja.repair;
+            if ((rep == nil or not rep.active) and not pt.repair_nudged) then
+                pt.repair_nudged = true;
+                if (pt.settings.automaton.oil and not g.oil_ready) then
+                    alert(('Automaton HP %d%%: Repair is ready, but there is no Automaton Oil in your ammo slot.'):format(g.pet_hpp), true);
+                else
+                    alert(('Automaton HP %d%%: Repair is ready.'):format(g.pet_hpp), true);
+                end
+            end
+        elseif (g.pet_hpp >= ra + 10) then
+            pt.repair_nudged = nil;
         end
     end
 end
@@ -804,9 +1315,11 @@ function pt.server_time()
     if (clock_ptr) then
         local ok, v = pcall(ashita.memory.read_uint32, clock_ptr + 0x0C);
         if (ok and type(v) == 'number' and math.abs(v - sys) < 86400) then
+            pt.clock_game = true;
             return v;
         end
     end
+    pt.clock_game = false;
     return sys;
 end
 
@@ -861,7 +1374,8 @@ end
 
 function pt.actions.reset_position()
     pt.settings.hud.x = 120;
-    pt.settings.hud.y = 260;
+    -- Growing upward, y is the bottom edge: put the top of the window where it would normally be.
+    pt.settings.hud.y = 260 + ((pt.settings.hud.grow == 'up') and math.max(ui.hud_h or 0, 120) or 0);
     pt.settings.hud.visible = true;
     ui.force_pos = true;
     pt.mark_dirty();
@@ -935,6 +1449,265 @@ function pt.actions.remove_custom(key)
     end
 end
 
+-- Every setting back to its default (the remembered automaton name is kept). The table is changed
+-- in place, so the settings library keeps saving the same table.
+function pt.actions.reset_all()
+    local cfg = pt.settings;
+    local last_pet = cfg.names and cfg.names.last_pet or '';
+    local fresh = data.default_settings();
+    fresh.names.last_pet = last_pet;
+    for k in pairs(cfg) do
+        cfg[k] = nil;
+    end
+    for k, v in pairs(fresh) do
+        cfg[k] = v;
+    end
+    sanitize(cfg);
+    pt.chat_ctx = nil;
+    pt.load_msg = nil;
+    ui.grow_fix = nil;
+    ui.force_pos = true;
+    ui.sync_buffers();
+    ui.invalidate_caches();
+    pt.mark_dirty();
+end
+
+----------------------------------------------------------------------------------------------------
+-- Profiles: one file shared by every character (config\addons\puptimers\profiles.lua)
+----------------------------------------------------------------------------------------------------
+
+-- A whole file as text, or nil and a reason ('missing' or 'too large'); bigger files are not read.
+local function read_file(path, limit)
+    local f = io.open(path, 'rb');
+    if (f == nil) then
+        return nil, 'missing';
+    end
+    local size = f:seek('end');
+    if (size == nil or size > limit) then
+        f:close();
+        return nil, 'too large';
+    end
+    f:seek('set', 0);
+    local text = f:read('*a');
+    f:close();
+    return text or '';
+end
+
+local function profiles_folder()
+    local base = tostring(AshitaCore:GetInstallPath() or ''):gsub('[\\/]+$', '');
+    return ('%s\\config\\addons\\%s\\'):format(base, addon.name);
+end
+
+--[[
+* The saved profiles, read from disk at most every 2 seconds (the settings window asks every frame;
+* other game windows may change the file). An unchanged file is not parsed again. force: always a
+* fresh table, for changing and writing back.
+--]]
+function pt.profiles_read(force)
+    local now = os.clock();
+    if (not force and pt.profiles_cache ~= nil and now < (pt.profiles_at or 0)) then
+        return pt.profiles_cache;
+    end
+    pt.profiles_at = now + 2.0;
+    local text, why = read_file(profiles_folder() .. 'profiles.lua', profiles.MAX_FILE);
+    if (not force and text ~= nil and text == pt.profiles_text and pt.profiles_cache ~= nil) then
+        return pt.profiles_cache;
+    end
+    local t = { list = {} };
+    pt.profiles_error = nil;
+    if (text ~= nil) then
+        local parsed, perr = profiles.parse(text);
+        if (parsed ~= nil) then
+            t = parsed;
+        else
+            pt.profiles_error = perr;
+        end
+    elseif (why ~= 'missing') then
+        pt.profiles_error = why;
+    end
+    pt.profiles_text = text;
+    pt.profiles_cache = t;
+    return t;
+end
+
+--[[
+* Written to a temporary file of this character's own (two game windows never share one), then moved
+* over profiles.lua in one step (ashita.fs.rename replaces the old file). If anything fails, the old
+* file is left as it was.
+--]]
+local function profiles_write(t)
+    local folder = profiles_folder();
+    pcall(ashita.fs.create_dir, folder);
+    local path = folder .. 'profiles.lua';
+    local tag = tostring(pt.game.player_name or ''):gsub('%W', '');
+    local tmp = ('%s.%s.tmp'):format(path, (tag ~= '') and tag or 'pt');
+    -- Whatever happens next, the cached copy may no longer match the file: read it again next time.
+    pt.profiles_text, pt.profiles_cache = nil, nil;
+    local f = io.open(tmp, 'wb');
+    if (f == nil) then
+        return false;
+    end
+    local text = profiles.serialize(t);
+    local ok = (f:write(text) ~= nil);
+    ok = (f:close() and ok) and true or false;
+    if (not ok) then
+        os.remove(tmp);
+        return false;
+    end
+    local rok, moved = pcall(ashita.fs.rename, tmp, path);
+    if (not (rok and moved)) then
+        os.remove(tmp);
+        return false;
+    end
+    pt.profiles_text, pt.profiles_cache = text, t;
+    pt.profiles_at = os.clock() + 2.0;
+    return true;
+end
+
+-- Other characters with PupTimers settings: { name, file }, looked up at most every 5 seconds.
+function pt.other_characters()
+    local now = os.clock();
+    if (pt.others_cache ~= nil and now < (pt.others_at or 0)) then
+        return pt.others_cache;
+    end
+    pt.others_at = now + 5.0;
+    local out = {};
+    local root = profiles_folder();
+    local ok, dirs = pcall(ashita.fs.get_directory, root);
+    if (ok and type(dirs) == 'table') then
+        local mine = tostring(pt.settings_folder or ''):lower():match('([^\\/]+)[\\/]*$');
+        for _, d in ipairs(dirs) do
+            d = tostring(d);
+            local name = d:match('^(%a+)_%d+$');
+            local file = root .. d .. '\\settings.lua';
+            if (name ~= nil and d:lower() ~= mine and ashita.fs.exists(file)) then
+                out[#out + 1] = { name = name, file = file };
+            end
+        end
+        table.sort(out, function (a, b) return a.name < b.name; end);
+    end
+    pt.others_cache = out;
+    return out;
+end
+
+-- Copies another character's settings (everything a profile holds) into this character's.
+function pt.actions.copy_from(name)
+    local want = tostring(name or ''):lower();
+    pt.others_at = 0;
+    for _, c in ipairs(pt.other_characters()) do
+        if (c.name:lower() == want) then
+            local text, ferr = read_file(c.file, profiles.MAX_SETTINGS);
+            if (text == nil) then
+                return false, ('Could not open the settings of %s (%s).'):format(c.name, ferr);
+            end
+            local t, why = profiles.read_settings_text(text);
+            if (t == nil) then
+                return false, ('Could not read the settings of %s (%s). If that character is logged in on another window, try again in a moment.'):format(c.name, tostring(why));
+            end
+            migrate(t);
+            profiles.apply(pt.settings, profiles.snapshot(t));
+            sanitize(pt.settings);
+            pt.chat_ctx = nil;
+            ui.sync_buffers();
+            ui.invalidate_caches();
+            pt.mark_dirty();
+            return true, ('Copied the settings of %s (window position, the way new bars grow, and names stay as they are).'):format(c.name);
+        end
+    end
+    return false, ('No PupTimers settings found for %s.'):format(tostring(name));
+end
+
+function pt.profiles_error_text()
+    return ('The profiles file could not be read (%s), so it is left as it is. Fix or delete config\\addons\\puptimers\\profiles.lua to start again.'):format(tostring(pt.profiles_error));
+end
+
+function pt.actions.profile_save(name)
+    name = profiles.clean_name(name);
+    if (name == nil) then
+        return false, 'Type a name for the profile first.';
+    end
+    local t = pt.profiles_read(true);
+    if (pt.profiles_error ~= nil) then
+        return false, pt.profiles_error_text();
+    end
+    local n = 0;
+    for _ in pairs(t.list) do
+        n = n + 1;
+    end
+    if (t.list[name] == nil and n >= profiles.MAX_PROFILES) then
+        return false, 'Too many profiles: delete one first.';
+    end
+    t.list[name] = profiles.snapshot(pt.settings);
+    if (not profiles_write(t)) then
+        return false, 'Could not write the profiles file.';
+    end
+    pt.settings.profiles.last = name;
+    pt.mark_dirty();
+    return true, ('Saved profile "%s".'):format(name);
+end
+
+function pt.actions.profile_load(name)
+    local t = pt.profiles_read(true);
+    local p = t.list[name];
+    if (pt.profiles_error ~= nil) then
+        return false, pt.profiles_error_text();
+    end
+    if (p == nil) then
+        return false, ('There is no profile "%s".'):format(tostring(name));
+    end
+    profiles.apply(pt.settings, p);
+    sanitize(pt.settings);
+    pt.settings.profiles.last = name;
+    pt.chat_ctx = nil;
+    ui.sync_buffers();
+    ui.invalidate_caches();
+    pt.mark_dirty();
+    return true, ('Loaded profile "%s".'):format(name);
+end
+
+-- Returns true and a message, or false and why not.
+function pt.actions.profile_delete(name)
+    local t = pt.profiles_read(true);
+    if (pt.profiles_error ~= nil) then
+        return false, pt.profiles_error_text();
+    end
+    if (t.list[name] == nil) then
+        return false, ('There is no profile "%s".'):format(tostring(name));
+    end
+    t.list[name] = nil;
+    if (not profiles_write(t)) then
+        return false, 'Could not write the profiles file, so the profile was not deleted.';
+    end
+    -- Frames linked to it load nothing from now on (only once it is really gone).
+    for k, v in pairs(pt.settings.profiles.frames) do
+        if (v == name) then
+            pt.settings.profiles.frames[k] = '';
+        end
+    end
+    pt.mark_dirty();
+    return true, ('Deleted profile "%s".'):format(name);
+end
+
+-- A colour scheme for the window, the elements and the automaton abilities (added abilities keep
+-- their own colours).
+function pt.actions.apply_palette(name)
+    local p = data.palette(name);
+    local cfg = pt.settings;
+    for k, v in pairs(p.colors) do
+        cfg.colors[k] = v;
+    end
+    for k, v in pairs(p.elements) do
+        cfg.maneuvers.colors[k] = v;
+    end
+    for k, v in pairs(p.abilities) do
+        if (cfg.abilities[k] ~= nil) then
+            cfg.abilities[k].color = v;
+        end
+    end
+    ui.invalidate_caches();
+    pt.mark_dirty();
+end
+
 function pt.actions.restore_ability_defaults()
     local d = data.default_settings();
     for key, dv in pairs(d.abilities) do
@@ -980,6 +1753,7 @@ end
 local function print_status()
     local g = pt.game;
     local cfg = pt.settings;
+    msg(('PupTimers %s'):format(addon.version));
     msg(('Job: %s%s'):format(g.logged_in and g.job_text or 'not logged in', g.is_pup and '' or ' (not PUP: timers hidden)'));
     msg(('Player: %s %s'):format(pt.effective_player_name() ~= '' and pt.effective_player_name() or '?', cfg.names.player ~= '' and '(manual)' or '(auto)'));
     msg(('Automaton: %s %s, %s'):format(pt.effective_pet_name() ~= '' and pt.effective_pet_name() or '?', cfg.names.pet ~= '' and '(manual)' or '(auto)', g.pet_present and 'active' or 'not out'));
@@ -987,11 +1761,45 @@ local function print_status()
     local n = 0;
     for _ in pairs(pt.state.timers) do n = n + 1; end
     msg(('Running ability timers: %d, active maneuvers: %d'):format(n, #pt.state.man.list));
+    local tm = cfg.maneuvers.timer_mode;
+    local how;
+    if (tm == 'game') then
+        how = 'the game\'s buff timers';
+    elseif (tm == 'flat') then
+        how = ('a flat %ds'):format(tonumber(cfg.maneuvers.duration) or 60);
+    elseif (pt.long_maneuvers) then
+        how = ('auto: following the game\'s buff timers (a maneuver lasted %ds)'):format(math.floor((pt.long_seen or 0) + 0.5));
+    else
+        how = ('auto: a flat %ds so far'):format(tonumber(cfg.maneuvers.duration) or 60);
+    end
+    msg('Maneuver timers: ' .. how);
+    local r = pt.ov.rules;
+    if (pt.burden_rule ~= nil) then
+        msg(('Burden per maneuver: from stats (%s server rule, matched the game %d times).%s'):format(pt.burden_rule == 'era' and 'current' or 'older', r[pt.burden_rule].n,
+            stats_fresh() and '' or ' Your gear or buffs changed since the game last sent your stats, so until it sends them again the values learned from its reports are used (Dark Maneuvers excepted).'));
+    else
+        msg(('Burden per maneuver: learned from the game\'s reports (%d so far).'):format(r.learned.n));
+    end
+    if (pt.kit.known) then
+        msg(('Automaton setup: %s, %s; attachments: %s.'):format(pt.kit.frame_name or '?', pt.kit.head_name or '?',
+            (#pt.kit.attachment_names > 0) and table.concat(pt.kit.attachment_names, ', ') or 'none'));
+    else
+        msg('Automaton setup: not read yet (it arrives with zoning or your next maneuver).');
+    end
+    for part in pairs(pt.stopped) do
+        msg(('Switched off after repeated errors: %s'):format(part));
+    end
+    if (pt.last_error ~= nil) then
+        msg('Last error: ' .. pt.last_error);
+    end
 end
 
 local function print_help()
-    msg('Commands: /pupt (settings window), /pupt show|hide, /pupt lock|unlock, /pupt test, /pupt clear,');
-    msg('  /pupt pet <name|auto>, /pupt player <name|auto>, /pupt start <ability>, /pupt resetpos, /pupt status, /pupt debug');
+    msg('Commands: /pupt (settings window), /pupt show|hide|toggle, /pupt lock|unlock, /pupt test, /pupt clear,');
+    msg('  /pupt pet <name|auto>, /pupt player <name|auto>, /pupt start <ability>, /pupt resetpos,');
+    msg('  /pupt profile [name | save <name> | delete <name>], /pupt copyfrom <character>,');
+    msg('  /pupt status, /pupt debug,');
+    msg('  /pupt defaults (every setting back to its default)');
 end
 
 ashita.events.register('command', 'puptimers_command', function (e)
@@ -1059,6 +1867,38 @@ ashita.events.register('command', 'puptimers_command', function (e)
         end
     elseif (sub == 'status') then
         print_status();
+    elseif (sub == 'profile') then
+        if (rest == '') then
+            local names = {};
+            for name in pairs(pt.profiles_read(true).list) do
+                names[#names + 1] = name;
+            end
+            table.sort(names);
+            if (pt.profiles_error ~= nil) then
+                msg(pt.profiles_error_text());
+            else
+                msg((#names > 0) and ('Profiles: ' .. table.concat(names, ', ') .. '. /pupt profile <name> loads one.') or 'No profiles saved yet: /pupt opens settings -> Profiles.');
+            end
+        else
+            local verb, name = rest:match('^(%S+)%s+(.+)$');
+            verb = verb and verb:lower();
+            if (verb == 'save') then
+                local _, text = pt.actions.profile_save(name);
+                msg(text);
+            elseif (verb == 'delete') then
+                local _, text = pt.actions.profile_delete(name);
+                msg(text);
+            else
+                local _, text = pt.actions.profile_load(rest);
+                msg(text);
+            end
+        end
+    elseif (sub == 'copyfrom') then
+        local _, text = pt.actions.copy_from(rest);
+        msg(text);
+    elseif (sub == 'defaults') then
+        pt.actions.reset_all();
+        msg('All settings are back to their defaults. The timer window is unlocked: drag it into place, then /pupt lock.');
     elseif (sub == 'debug') then
         pt.settings.behavior.debug = not pt.settings.behavior.debug;
         pt.mark_dirty();
@@ -1072,26 +1912,61 @@ end);
 -- Game events
 ----------------------------------------------------------------------------------------------------
 
--- Runs fn, reporting errors at most once every 10 seconds per event instead of every frame.
+-- What each guarded part does, for the error line players see.
+local PART_NAMES = {
+    actions = 'reading action data', status = 'reading buff timers', chat = 'reading chat lines',
+    setup = 'reading the automaton setup',
+    poll = 'reading the game', timers = 'updating timers', render = 'drawing its windows',
+    settings = 'checking settings', save = 'saving settings', frame = 'running',
+};
+-- Parts that are switched off after repeated errors: each has a backup (action data <-> chat).
+local STOPPABLE = { actions = true, chat = true };
+
+--[[
+* Runs fn. An error is reported in one plain line, then at most once a minute per part (every 10 s
+* with /pupt debug on, with the full text); the last one is kept for /pupt status.
+--]]
 local function guarded(name, fn, ...)
+    if (pt.stopped[name]) then
+        return;
+    end
     local ok, err = pcall(fn, ...);
     if (not ok) then
         local now = os.clock();
-        if ((now - (pt.errors_at[name] or -100)) > 10) then
+        local n = (pt.error_counts[name] or 0) + 1;
+        pt.error_counts[name] = n;
+        pt.last_error = ('%s: %s'):format(name, tostring(err));
+        local what = PART_NAMES[name] or name;
+        if (STOPPABLE[name] and n >= 20) then
+            pt.stopped[name] = true;
+            print(chat.header('PupTimers'):append(chat.error(('Stopped %s after repeated problems; everything else keeps working. Reload PupTimers to try again (/pupt status shows the last error).'):format(what))));
+            return;
+        end
+        local dbg = pt.settings ~= nil and pt.settings.behavior.debug;
+        if ((now - (pt.errors_at[name] or -100)) > (dbg and 10 or 60)) then
             pt.errors_at[name] = now;
-            print(chat.header('PupTimers'):append(chat.error(('%s error: %s'):format(name, tostring(err)))));
+            local text = tostring(err);
+            if (not dbg) then
+                text = text:match('[^\n]*'):sub(1, 120);
+            end
+            print(chat.header('PupTimers'):append(chat.error(('A problem %s (%s). PupTimers keeps running.'):format(what, text))));
         end
     end
 end
 
 -- Status timers (0x063): the real end time of every buff, including maneuvers and Overload.
 local function on_status_packet(e)
+    if (not pt.game.is_pup) then
+        return;
+    end
     local list = core.parse_status_timers(e.data_modified or e.data);
     if (list == nil) then
         return;
     end
-    local ends = core.buff_end_times(list, pt.server_time(), os.clock());
+    local now = os.clock();
+    local ends = core.buff_end_times(list, pt.server_time(), now);
     pt.buff_ends = ends;
+    pt.buff_ends_at = (ends ~= nil) and now or nil;
     if (ends == nil) then
         pt.buff_ends_rejected = (pt.buff_ends_rejected or 0) + 1;
     end
@@ -1116,25 +1991,119 @@ local function on_action_packet(e)
     if (actor == 0 or (actor ~= g.player_id and actor ~= g.pet_id)) then
         return;
     end
-    local ev = core.interpret_action(core.parse_action(bytes), g.player_id, g.pet_id);
+    local act = core.parse_action(bytes);
+    if (act ~= nil and actor == g.pet_id) then
+        -- For the used-up notes: Flame Holder fires on weapon skills, Ice Maker on elemental nukes.
+        local c, prm = act.category, act.param or 0;
+        if (c == 11 and data.automaton_ws[prm] ~= nil) then
+            pt.pet_ws_at = os.clock();
+        elseif (c == 4 and prm >= data.NUKE_FIRST and prm <= data.NUKE_LAST) then
+            pt.pet_nuke_at = os.clock();
+        end
+    end
+    local ev = core.interpret_action(act, g.player_id, g.pet_id);
     if (ev ~= nil) then
         handle_event(ev, 'packet', os.clock());
+    end
+end
+
+--[[
+* What the automaton's setup means for PupTimers: frame, attachments that matter, and which of the
+* automaton abilities it can use. Rebuilt only when the head, frame or attachments change.
+--]]
+local function rebuild_kit(now)
+    local st = pt.setup;
+    local kit = { known = true, abilities = {}, attachment_names = {} };
+    local f = data.frame_by_byte[st.frame];
+    kit.frame_key = f and f.key or nil;
+    kit.frame_name = f and f.name or nil;
+    kit.head_name = data.heads[st.head];
+    for name, byte in pairs(data.ATT) do
+        kit[name] = setup.has(st, byte);
+    end
+    for _, a in ipairs(data.abilities) do
+        if (a.att ~= nil) then
+            kit.abilities[a.key] = setup.has(st, a.att);
+        elseif (a.frame ~= nil) then
+            kit.abilities[a.key] = (st.frame == a.frame);
+        end
+    end
+    for i = 1, 12 do
+        local b = st.slots[i];
+        if (b ~= 0) then
+            kit.attachment_names[#kit.attachment_names + 1] = data.attachments[b] or ('#' .. b);
+        end
+    end
+    pt.kit = kit;
+    pt.unpowered_key = nil;
+    debug(('Automaton setup: %s, %s; %s.'):format(kit.frame_name or '?', kit.head_name or '?',
+        (#kit.attachment_names > 0) and table.concat(kit.attachment_names, ', ') or 'no attachments'));
+    -- Profiles that follow the frame.
+    if (kit.frame_key ~= nil and kit.frame_key ~= pt.kit_frame) then
+        local first = (pt.kit_frame == nil);
+        pt.kit_frame = kit.frame_key;
+        local pc = pt.settings.profiles;
+        local name = pc.frames[kit.frame_key];
+        if (pc.auto and type(name) == 'string' and name ~= '' and not (first and name == pc.last)) then
+            local ok, text = pt.actions.profile_load(name);
+            msg(ok and ('%s: loaded profile "%s".'):format(kit.frame_name, name) or text);
+        end
+    end
+end
+
+-- Packet 0x044: the automaton's setup, HP/MP and stats (see pt_setup.lua).
+local function on_setup_packet(e)
+    local g = pt.game;
+    if (not g.is_pup) then
+        return;
+    end
+    local d = e.data_modified or e.data;
+    if (type(d) ~= 'string' or #d < setup.MIN_SIZE or d:byte(5) ~= setup.PUP_JOB) then
+        return;
+    end
+    -- PUP as the main job: the main-job copy; PUP as the support job: the support-job copy.
+    if ((d:byte(6) == 1) == g.main_is_pup) then
+        return;
+    end
+    local now = os.clock();
+    local ok, changed = setup.parse(pt.setup, d, now);
+    if (ok and changed) then
+        rebuild_kit(now);
     end
 end
 
 ashita.events.register('packet_in', 'puptimers_packet_in', function (e)
     local id = e.id;
     if (id == 0x0028) then
-        guarded('packet', on_action_packet, e);
+        guarded('actions', on_action_packet, e);
     elseif (id == 0x0063) then
-        guarded('packet', on_status_packet, e);
+        guarded('status', on_status_packet, e);
+    elseif (id == 0x0044) then
+        guarded('setup', on_setup_packet, e);
+    elseif (id == 0x0061) then
+        guarded('setup', on_stats_packet, e);
     end
 end);
 
 -- Chat lines. Every line of every chat mode arrives here; cheap plain-text checks discard almost
 -- all of them before anything is parsed.
+-- Conversation channels, incoming and your own echo (say 9/1, shout 10/2, yell 11/3, tell 12/4,
+-- party 13/5, linkshell 14/6, emote 15/7, linkshell 2 214/213, unity 212/211, assist 220/219 and
+-- 222/221, party/alliance 215). Whatever a line there says (an /em, a joke in party chat), it is not
+-- a maneuver or an automaton ability. Anything else is read, so an unknown battle-log mode is never lost.
+local TALK = {
+    [1] = true, [2] = true, [3] = true, [4] = true, [5] = true, [6] = true, [7] = true,
+    [9] = true, [10] = true, [11] = true, [12] = true, [13] = true, [14] = true, [15] = true,
+    [211] = true, [212] = true, [213] = true, [214] = true, [215] = true,
+    [219] = true, [220] = true, [221] = true, [222] = true,
+};
+
 local function on_text(e)
     if (not pt.game.is_pup or not pt.settings.detect.chat) then
+        return;
+    end
+    local mode = tonumber(e.mode);
+    if (mode ~= nil and TALK[bit.band(mode, 0xFF)]) then
         return;
     end
     local line = e.message;
@@ -1200,9 +2169,13 @@ settings.register('settings', 'puptimers_settings_update', function (s)
     end
     pt.settings_folder = current_settings_folder();
     unshare(pt.settings, DEFAULTS);
+    migrate(pt.settings);
     sanitize(pt.settings);
     pt.state = core.new_state();
     pt.buff_ends = nil;
+    pt.setup, pt.kit, pt.kit_frame = setup.new(), { known = false }, nil;
+    pt.stats_at = nil;
+    reset_oil();
     pt.ov = ov.new();
     pt.ov_last = nil;
     pt.ov_params = nil;
@@ -1213,16 +2186,12 @@ settings.register('settings', 'puptimers_settings_update', function (s)
     pt.unknown_seen = {};
     pt.chat_ctx = nil;
     pt.test_until = nil;
+    ui.grow_fix = nil;
     ui.force_pos = true;
     ui.sync_buffers();
     settings.save();
 end);
 
-ashita.events.register('load', 'puptimers_load', function ()
-    if (not pt.settings.hud.locked) then
-        msg('Loaded. The timer window is unlocked: drag it into place, resize it from the corner, then type /pupt lock. /pupt opens settings.');
-    end
-end);
 
 ashita.events.register('unload', 'puptimers_unload', function ()
     pcall(check_settings_switch);

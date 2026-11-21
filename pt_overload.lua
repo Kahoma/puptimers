@@ -42,9 +42,11 @@ function ov.params(cfg, thresh_mod, decay_mod, suppress, overdrive, out)
     p.spawn_burden   = tonumber(o.spawn_burden) or 0;
     p.suppress       = (suppress == true);
     if (p.suppress) then
-        -- Kenkonken: every burden gain is divided by 3 (rounded down) on the server.
+        -- Kenkonken: every burden gain is divided by 3 (rounded down) on the server, the burden
+        -- a new automaton starts with included.
         p.default_burden = math.floor(p.default_burden / 3);
         p.dark_burden = math.floor(p.dark_burden / 3);
+        p.spawn_burden = math.floor(p.spawn_burden / 3);
     end
     return p;
 end
@@ -81,10 +83,45 @@ function ov.new()
             t      = 0,
             exact  = false,   -- true when pinned by a report above 0%
             b      = nil,     -- learned burden per maneuver for this element
+            pred   = nil,     -- burden the next maneuver adds, worked out from stats (set from outside)
             used   = false,   -- seen at least one maneuver of this element
         };
     end
+    -- How well each way of predicting the burden of a maneuver matched the game's reports:
+    -- 'era' and 'classic' are the two server rules worked out from stats, 'learned' is the learned value.
+    st.rules = {
+        era     = { err = 0, n = 0 },
+        classic = { err = 0, n = 0 },
+        learned = { err = 0, n = 0 },
+    };
     return st;
+end
+
+-- One more comparison of a prediction with what the game's reports showed. Off by one is not held
+-- against it: the server's 3-second cooling tick can fall either side of a report.
+local function score(r, pred, obs)
+    local err = math.max(0, math.abs(pred - obs) - 1);
+    r.err = (r.n == 0) and err or (r.err * 0.7 + err * 0.3);
+    r.n = r.n + 1;
+end
+
+--[[
+* The stat rule that predicts the burden of a maneuver best, or nil: it must have matched the game's
+* reports at least twice, within a tick, and at least as well as the learned values.
+--]]
+function ov.best_rule(st)
+    local best, best_r = nil, nil;
+    for _, k in ipairs({ 'era', 'classic' }) do
+        local r = st.rules[k];
+        if (r.n >= 2 and r.err <= 0.5 and (best_r == nil or r.err < best_r.err)) then
+            best, best_r = k, r;
+        end
+    end
+    local l = st.rules.learned;
+    if (best_r ~= nil and l.n >= 2 and l.err < best_r.err) then
+        return nil;
+    end
+    return best;
 end
 
 -- How long an "unknown since load" estimate is flagged: by then any usual burden has cooled a lot.
@@ -116,6 +153,9 @@ function ov.burden(st, e, now, p)
 end
 
 local function per_maneuver(s, e, p)
+    if (s.pred ~= nil) then
+        return s.pred;
+    end
     if (s.b ~= nil) then
         return s.b;
     end
@@ -148,14 +188,20 @@ end
 * A maneuver of element e was used.
 * @param report - { chance = n, overloaded = bool } from the server, or nil if none was seen
 --]]
-function ov.on_maneuver(st, e, now, p, report)
+--[[
+* era / classic: the burden this maneuver adds by the two server rules, worked out from stats at the
+* moment it was used (nil when not known); they are scored against the game's reports.
+--]]
+function ov.on_maneuver(st, e, now, p, report, era, classic)
     local s = st.el[e];
     if (s == nil) then
         return;
     end
     local before = ov.burden(st, e, now, p);
     -- Remember the state before this maneuver so a report arriving a moment later can be matched.
-    s.pending = { time = now, before = before, was_exact = s.exact, was_used = s.used };
+    s.pending = { time = now, before = before, was_exact = s.exact, was_used = s.used,
+                  learned = (s.b ~= nil) and s.b or ((e == 8) and p.dark_burden or p.default_burden),
+                  era = era, classic = classic };
     s.burden = math.min(255, before + per_maneuver(s, e, p));
     s.t = now;
     s.exact = false;
@@ -191,6 +237,13 @@ function ov.on_report(st, e, now, p, chance, overloaded)
         if (pend ~= nil and pend.was_exact and pend.was_used) then
             local b_obs = new - pend.before;
             if (b_obs >= 1 and b_obs <= 60) then
+                score(st.rules.learned, pend.learned, b_obs);
+                if (pend.era ~= nil) then
+                    score(st.rules.era, pend.era, b_obs);
+                end
+                if (pend.classic ~= nil) then
+                    score(st.rules.classic, pend.classic, b_obs);
+                end
                 s.b = (s.b == nil) and b_obs or (s.b * 0.5 + b_obs * 0.5);
             end
         end
@@ -365,10 +418,11 @@ function ov.rows(st, now, p, cfg)
         local name = it.all and 'all' or data.elements[it.e].name;
         local pct = math.floor(it.chance + 0.5);
         rows[#rows + 1] = {
-            label  = ('Overload %s %d%%'):format(name, pct),
-            short_label = ('%s %d%%'):format(it.all and 'All' or name, pct),   -- for narrow windows
+            -- '~': estimates between the game's reports, not numbers the game printed.
+            label  = ('Overload %s ~%d%%'):format(name, pct),
+            short_label = ('%s ~%d%%'):format(it.all and 'All' or name, pct),  -- for narrow windows
             right_optional = true,                                             -- dropped first when space runs out
-            right  = od and 'after OD' or ('next %d%%'):format(math.floor(it.risk + 0.5)),
+            right  = od and 'after OD' or ('next ~%d%%'):format(math.floor(it.risk + 0.5)),
             frac   = by_chance and math.min(1, it.chance / full) or math.min(1, it.burden / scale),
             marker = (not by_chance) and math.min(1, p.T / scale) or nil,
             color  = col,

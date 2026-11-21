@@ -55,6 +55,7 @@ local WARN  = { 1.00, 0.70, 0.25, 1.0 };
 local BAD   = { 1.00, 0.45, 0.40, 1.0 };
 
 local SECTION_NAMES = {
+    automaton = 'Automaton HP / MP',
     maneuvers = 'Maneuvers',
     abilities = 'Automaton abilities',
     recasts   = 'Job ability recasts',
@@ -382,6 +383,14 @@ local function draw_row(dl, x, y, w, h, row, now, cfg, text_h, shadow_u32)
         local mx = math.floor(x + w * clamp(row.marker, 0, 1)) + 0.5;
         d_line(dl, mx, y + 1, mx, y + h - 1, u32(colors.marker or MARKER_DEFAULT), math.max(1, ui.cur_scale * 1.5));
     end
+    local marks = row.marks;
+    if (marks ~= nil) then
+        -- e.g. where Economizer and Mana Converter fire on the automaton's MP bar
+        for i = 1, #marks do
+            local mx = math.floor(x + w * clamp(marks[i], 0, 1)) + 0.5;
+            d_line(dl, mx, y + 1, mx, y + h - 1, u32(colors.marker or MARKER_DEFAULT), math.max(1, ui.cur_scale));
+        end
+    end
 
     local pad = math.max(3, math.floor(4 * ui.cur_scale));
     local right = row.right or '';
@@ -625,6 +634,10 @@ ui.view_next = 0;
 ui.cache_reset_at = 0;
 ui.text_h = 14;
 ui.hud_h = 0;                -- timer window height, measured from its content (0 until the first frame)
+ui.placed_h = 0;             -- the height the window was last placed with (growing upward)
+ui.anchor_up = false;        -- this frame's y is the bottom edge
+ui.grow_fix = nil;           -- 'New bars appear' was switched: { grow, h = height y was converted with }
+ui.grow_measured = false;    -- a frame was drawn and measured since that switch
 ui.hud_bottom = nil;
 
 local ENV = {};              -- reused argument table for core.build_view
@@ -660,6 +673,15 @@ local function build_view(now, cfg, unlocked, testing)
     ENV.maneuver_recast_at = pt.game.maneuver_recast_at;
     ENV.overload_rows      = ov_rows;
     ENV.overload_left      = ov_left;
+    ENV.pet_hpp            = pt.game.pet_hpp;
+    ENV.pet_mpp            = pt.game.pet_mpp;
+    ENV.pet_mp_marks       = pt.game.pet_mp_marks;
+    ENV.pet_hp_marks       = pt.game.pet_hp_marks;
+    ENV.deactivate_hint    = pt.game.deactivate_hint;
+    ENV.repair_label       = pt.game.repair_label;
+    ENV.man_counts         = pt.game.man_counts;
+    ENV.unpowered_text     = pt.game.unpowered_text;
+    ENV.unpowered_short    = pt.game.unpowered_short;
     local view = core.build_view(pt.state, cfg, now, ENV);
     if (testing) then
         merge_demo(view, core.demo_view(cfg, now));
@@ -685,6 +707,9 @@ function ui.render_hud(now)
     local unlocked = not hud.locked;
     local testing = (pt.test_until ~= nil and now < pt.test_until);
 
+    if (hud.hide_in_events and pt.game.in_event and not testing and not (unlocked and ui.config_open[1])) then
+        return;   -- cutscene or NPC conversation: timers keep counting, the window comes back after
+    end
     if (hud.only_on_pup and not pt.game.is_pup and not testing) then
         -- Still allow positioning the window from the settings screen.
         if (not (unlocked and ui.config_open[1])) then
@@ -725,11 +750,37 @@ function ui.render_hud(now)
         flags = bor(flags, ImGuiWindowFlags_NoBackground);
     end
 
-    if (ui.force_pos) then
-        A_POS[1], A_POS[2] = hud.x, hud.y;
+    -- 'New bars appear' was switched: y was converted at once (top edge <-> bottom edge) with the
+    -- last known height, so the saved settings always make sense. If the window had been hidden, its
+    -- height may differ by the time it shows: corrected once with the height it really has.
+    local fix = ui.grow_fix;
+    if (fix ~= nil) then
+        if (fix.grow ~= hud.grow) then
+            ui.grow_fix = nil;
+        elseif (ui.grow_measured and ui.hud_h > 0) then
+            local d = ui.hud_h - fix.h;
+            if (d ~= 0) then
+                hud.y = (hud.grow == 'up') and (hud.y + d) or (hud.y - d);
+                ui.force_pos = true;
+                pt.mark_dirty();
+            end
+            ui.grow_fix = nil;
+        end
+    end
+    -- Growing upward, the saved y is the window's bottom edge: the window is placed again whenever
+    -- its height changes (every frame while locked) so the bottom stays put as bars come and go.
+    -- While unlocked it is only placed when the height changes, so it can still be dragged.
+    local up = (hud.grow == 'up');
+    ui.anchor_up = up;
+    local reanchor = up and unlocked and ui.hud_h > 0 and ui.hud_h ~= ui.placed_h;
+    if (ui.force_pos or (up and not unlocked) or reanchor) then
+        A_POS[1], A_POS[2] = hud.x, up and (hud.y - ui.hud_h) or hud.y;
         imgui.SetNextWindowPos(A_POS, ImGuiCond_Always);
-        ui.force_pos = false;
-        ui.settle = 2;
+        ui.placed_h = ui.hud_h;
+        if (ui.force_pos) then
+            ui.force_pos = false;
+            ui.settle = 2;
+        end
     end
     -- Width comes from the settings (the corner grip changes it while unlocked). Height is the content
     -- height measured on the previous frame. A height of 0 would make ImGui auto-fit the window, and
@@ -761,6 +812,7 @@ function ui.render_hud(now)
         ok, err = pcall(ui.draw_hud_body, view, cfg, hud, now, spacing, unlocked, STACK, sc);
         if (ok and ui.hud_bottom ~= nil) then
             ui.hud_h = math.max(math.ceil(ui.hud_bottom + pad - 0.01), 8);
+            ui.grow_measured = true;
         end
     end
     if (STACK.spacing) then
@@ -838,7 +890,10 @@ function ui.draw_hud_body(view, cfg, hud, now, spacing, unlocked, stack, sc)
             ui.settle = ui.settle - 1;
         else
             local wx, wy = imgui.GetWindowPos();
-            local ww = imgui.GetWindowSize();
+            local ww, wh = imgui.GetWindowSize();
+            if (ui.anchor_up) then
+                wy = wy + (wh or 0);   -- the bottom edge is what is kept
+            end
             if (math.abs(wx - hud.x) >= 1 or math.abs(wy - hud.y) >= 1) then
                 hud.x = math.floor(wx);
                 hud.y = math.floor(wy);
@@ -1042,14 +1097,14 @@ local function tab_general()
         ui.force_pos = true;
     end
     checkbox('Hide when nothing is running', cfg.hud, 'hide_when_empty');
-    checkbox('Only show while Puppetmaster is my main or support job', cfg.hud, 'only_on_pup');
+    checkbox('Only show while Puppetmaster is my main or support job', cfg.hud, 'only_on_pup', 'PupTimers tracks nothing on other jobs. Turned off, the window can still be shown there while unlocked (with sample bars), to place it.');
     checkbox('Show preview bars while unlocked', cfg.hud, 'preview_unlocked', 'While the window is unlocked and idle it shows sample bars so you can place and size it.');
 
     heading('Detection');
     TextWrapped('Works the same with one chat window or a split two-window log: PupTimers reads the game data behind the log, not the windows on screen.');
     checkbox('Read action packets (recommended)', cfg.detect, 'packets', 'Sees your automaton\'s abilities and your maneuvers directly from the game\'s combat data. Works even if your chat filters hide those messages.');
     checkbox('Read the chat log', cfg.detect, 'chat', 'Watches for "<Automaton> uses <Ability>" lines, whichever log window shows them. Needed for abilities you add yourself, and a backup for the others until the packets report them.');
-    checkbox('Clear automaton timers when it leaves or a new one is called', cfg.behavior, 'reset_on_despawn', 'The server builds a new automaton, with every ability ready, each time you use Activate or Deus Ex Automata and when it follows you into a new zone.');
+    checkbox('Clear automaton timers when it leaves or a new one is called', cfg.behavior, 'reset_on_despawn', 'The server builds a new automaton each time you use Activate or Deus Ex Automata and when it follows you into a new zone. (Newer server code puts its abilities on cooldown then: tick "On act." for them on the Automaton tab.)');
     checkbox('Debug messages in chat', cfg.behavior, 'debug', 'Prints what PupTimers detects. Useful for checking that names are detected correctly.');
 
     heading('Tools');
@@ -1065,6 +1120,21 @@ local function tab_general()
     if (imgui.Button('Reset window position')) then
         pt.actions.reset_position();
         set_status('Timer window moved to the top-left area.');
+    end
+    imgui.SameLine();
+    local now = os.clock();
+    local armed = (ui.reset_armed_until ~= nil and now < ui.reset_armed_until);
+    if (imgui.Button(armed and 'Click again to reset everything##rst' or 'Reset all settings##rst')) then
+        if (armed) then
+            ui.reset_armed_until = nil;
+            pt.actions.reset_all();
+            set_status('All settings are back to their defaults.');
+        else
+            ui.reset_armed_until = now + 4;
+        end
+    end
+    if (imgui.IsItemHovered()) then
+        SetTooltip('Every PupTimers setting back to its default, for this character. Click twice to confirm. Same as /pupt defaults.');
     end
 end
 
@@ -1109,6 +1179,16 @@ local function tab_automaton()
     local cfg = pt.settings;
 
     TextWrapped('A bar starts the moment your automaton uses one of these abilities and counts down to when it can use it again. Default cooldowns come from the server scripts; change them if your server differs.');
+    local kit = pt.kit;
+    if (kit ~= nil and kit.known) then
+        TextDisabled(('Listed: what your automaton can use now (%s, %d attachments).'):format(kit.frame_name or '?', #kit.attachment_names));
+    else
+        TextDisabled('Your automaton\'s setup is not read yet (it arrives with zoning or your next maneuver), so every ability is listed.');
+    end
+    imgui.Checkbox('Show every ability##pt_ab_all', ui.ab_all);
+    if (imgui.IsItemHovered()) then
+        SetTooltip('Also list abilities your automaton\'s setup cannot use right now, and abilities from attachments that are not on HorizonXI.');
+    end
     imgui.Spacing();
 
     TextColored(DIM, 'On');
@@ -1118,13 +1198,15 @@ local function tab_automaton()
     imgui.SameLine(C_ALERT); TextColored(DIM, 'Alert');
     imgui.SameLine(C_SPAWN); TextColored(DIM, 'On act.');
     if (imgui.IsItemHovered()) then
-        SetTooltip('Start this timer when your automaton is activated.\nOnly LandSandBoat builds from mid-2026 on put attachment abilities on cooldown at activation;\nolder servers (likely including HorizonXI) do not, so leave this off unless you see it happen.');
+        SetTooltip('Start this timer when your automaton is activated.\nOnly LandSandBoat builds from mid-2026 on put attachment abilities on cooldown at activation;\nthe HorizonXI wiki says Shock Absorber can be used right after Activate, so leave this off unless you see it happen.');
     end
     imgui.Separator();
 
+    local all = ui.ab_all[1];
     for _, a in ipairs(data.abilities) do
         local store = cfg.abilities[a.key];
-        if (store ~= nil) then
+        local listed = all or (a.horizon ~= false and not (kit ~= nil and kit.known and kit.abilities[a.key] == false));
+        if (store ~= nil and listed) then
             ability_row(a.key, a.name, a.source, store, false);
         end
     end
@@ -1187,6 +1269,16 @@ local function tab_automaton()
         pt.actions.restore_ability_defaults();
         set_status('Default cooldowns and colors restored.');
     end
+
+    heading('Automaton HP and MP');
+    local ac = cfg.automaton;
+    TextWrapped('Thin HP and MP bars for your automaton, with Puppetmaster marks. If you use them, you can turn off the automaton part of another addon\'s pet bar.');
+    checkbox('Show the automaton\'s HP', ac, 'show_hp');
+    checkbox('Show the automaton\'s MP', ac, 'show_mp');
+    slider_int('Remind me to Repair at HP % (0 = off)', ac, 'repair_at', 0, 90, '%d', 'A chat/sound reminder when your automaton\'s HP falls to this and Repair is ready. A white line marks it on the HP bar.');
+    checkbox('Show the Automaton Oil on the Repair bar', ac, 'oil', 'For example "Repair (Oil+1 x5, 12 more)". Repair uses one oil from your ammo slot; you are told when Repair is ready with no oil equipped, and when the equipped stack runs out.');
+    checkbox('Say when Deactivate would reset Activate', ac, 'deactivate_hint', 'While Activate is cooling down, a line appears when your automaton is at exactly full HP: deactivating it then resets the Activate recast. PupTimers uses the exact HP the game sends, not the HP %.');
+    TextDisabled('With the setup read from the game, the MP bar marks where Economizer and Mana Converter will fire for the Dark Maneuvers you have up, and the HP bar where Replicator fires.');
 end
 
 local function tab_maneuvers()
@@ -1203,12 +1295,24 @@ local function tab_maneuvers()
         combo('Icon alignment', m, 'icon_align', { { 'left', 'Left' }, { 'center', 'Centered' } }, 220);
     end
     slider_int('Maneuver duration (seconds)', m, 'duration', 10, 300, '%d', 'Maneuvers last a flat 60 seconds on HorizonXI. Time left = when you used it + this.');
-    checkbox('Use the game\'s buff timers for every maneuver', m, 'real_timers', 'Only needed on servers where maneuver duration changes (e.g. grows during battle). Maneuvers that were already up when PupTimers loaded always use the game\'s timer.');
+    combo('Maneuver timers', m, 'timer_mode', { { 'auto', 'Auto (recommended)' }, { 'game', 'Always the game\'s buff timers' }, { 'flat', 'Always the duration above' } }, 260);
+    if (imgui.IsItemHovered()) then
+        SetTooltip('Auto counts each maneuver from when you used it, which is exact. If one ever lasts longer than the duration above (some servers lengthen maneuvers in long fights), it switches to the game\'s own buff timers. Maneuvers that were already up when PupTimers loaded always use the game\'s timers.');
+    end
+    if (pt.long_maneuvers) then
+        TextDisabled(('Following the game\'s timers: a maneuver lasted %ds.'):format(math.floor((pt.long_seen or 0) + 0.5)));
+    end
     checkbox('Show empty slots while the automaton is out', m, 'show_empty');
     checkbox('Show the shared maneuver recast', m, 'show_recast');
     checkbox('Show an OVERLOADED warning', m, 'show_overload');
     slider_int('Warn when below (seconds, 0 = off)', m, 'warn_at', 0, 30, '%d', 'The time turns orange and the bar pulses when a maneuver is about to wear off.');
     checkbox('Alert when a maneuver wears off', m, 'alert_wear', 'Uses the chat/sound options from the Alerts tab. Maneuvers replaced by a new maneuver are not announced.');
+
+    heading('Your automaton\'s attachments');
+    TextDisabled('These need the automaton\'s setup, which the game sends when you zone and with each maneuver.');
+    checkbox('Show abilities left without their maneuver', m, 'show_unpowered', 'A dim line under the maneuvers, e.g. "Unpowered: Provoke (Fire)", while your automaton is out.');
+    checkbox('Alert when losing a maneuver leaves an ability unpowered', m, 'alert_unpowered', 'Uses the chat/sound options from the Alerts tab.');
+    checkbox('Say in chat when an attachment uses up maneuvers', m, 'explain_used', 'The game shows nothing when, for example, Economizer uses up your Dark Maneuvers.');
 
     heading('Element colors');
     for i, e in ipairs(data.elements) do
@@ -1226,9 +1330,13 @@ local function tab_overload()
     local o = cfg.overload;
     local ovm = require('pt_overload');
 
-    TextWrapped('After each maneuver the game reports your automaton\'s overload chance for that element. PupTimers pins the burden from that number, lets it cool down at the server\'s rate, and shows how risky the NEXT maneuver of that element would be. The white line on the bar is the overload threshold.');
+    TextWrapped('After each maneuver the game reports your automaton\'s overload chance for that element. PupTimers pins the burden from that number, lets it cool down at the server\'s rate, and shows how risky the NEXT maneuver of that element would be. With bars that stay until the burden has fully cooled, a white line marks the overload threshold.');
     heading('Overload bar');
     checkbox('Show the overload estimate', o, 'enabled');
+    if (not o.enabled) then
+        TextWrapped('The estimate is off: PupTimers tracks no burden and gives no overload risk warnings. The OVERLOADED countdown still works, because it comes from your buff timers.');
+        return;
+    end
     combo('Bars', o, 'show', { { 'all', 'One bar per element' }, { 'top', 'Only the riskiest element' } }, 240);
     combo('A bar goes away when', o, 'hide_at', { { 'chance', 'its overload chance reaches 0%' }, { 'burden', 'its burden has fully cooled' } }, 240);
     if (o.hide_at ~= 'burden') then
@@ -1272,11 +1380,35 @@ local function tab_overload()
         end
     end
     imgui.Spacing();
-    TextColored(DIM, 'Attachments (the game does not show these to addons, so tick the ones you use)');
-    for _, a in ipairs(data.overload_attachments) do
-        push_id('att_' .. a.key);
-        checkbox(a.name, o, a.key, a.effect);
-        pop_id();
+    local kit = pt.kit;
+    checkbox('Take attachments from the game', o, 'attachments_auto', 'PupTimers reads your automaton\'s attachments from the game (they arrive with zoning and with each maneuver). Turn this off to tick them by hand.');
+    if (o.attachments_auto and kit ~= nil and kit.known) then
+        for _, a in ipairs(data.overload_attachments) do
+            if (kit[a.key]) then
+                TextColored(GOOD, ('  %s: equipped (%s)'):format(a.name, a.effect));
+            else
+                TextDisabled(('  %s: not equipped'):format(a.name));
+            end
+        end
+    else
+        TextColored(DIM, (o.attachments_auto and 'Not read from the game yet; until then these count:' or 'Tick the attachments you use:'));
+        for _, a in ipairs(data.overload_attachments) do
+            push_id('att_' .. a.key);
+            checkbox(a.name, o, a.key, a.effect);
+            pop_id();
+        end
+    end
+    slider_int('Heatsink: extra cooling per tick', o, 'heatsink_decay', 0, 6, '%d', 'Current server code for this era: +1 per 3 seconds on every element. The HorizonXI wiki\'s tested table differs, so adjust this if your estimate cools too slowly or too fast.');
+    checkbox('Heatsink cools more with Water Maneuvers up (older server rule)', o, 'heatsink_by_water', '+2/+4/+5/+6 per tick with 0/1/2/3 Water Maneuvers (LandSandBoat code until May 2025; its January 2026 code used +1/+3/+4/+5), instead of the setting above.');
+    checkbox('Work out each maneuver\'s burden from stats', o, 'use_stats', 'The server adds 14-20 burden per maneuver depending on your stat for that element against the automaton\'s (Dark: by frame). PupTimers reads both, tries the known server rules, and uses one only once the game\'s own overload reports confirm it. Your stats are only trusted while your gear and buffs are unchanged since the game last sent them.');
+    local rules = pt.ov.rules;
+    if (pt.burden_rule ~= nil) then
+        TextColored(GOOD, ('  Burden per maneuver: from stats (matched the game %d times).'):format(rules[pt.burden_rule].n));
+        if (not pt.stats_fresh()) then
+            TextDisabled('  Your gear or buffs changed since the game last sent your stats: until it sends them again, the values learned from its reports are used (Dark Maneuvers excepted).');
+        end
+    elseif (rules ~= nil) then
+        TextDisabled(('  Burden per maneuver: learned from the game\'s reports (%d so far).'):format(rules.learned.n));
     end
     local items = pt.gear.items or {};
     if (#items > 0) then
@@ -1317,7 +1449,7 @@ local function tab_overload()
             local risk = ovm.next_risk(pt.ov, e, now, p);
             Text(('%-8s burden %5.1f   chance now %3d   next %3d   per maneuver %s%s'):format(
                 data.elements[e].name, bur, math.floor(ovm.chance_of(bur, p) + 0.5), math.floor(risk + 0.5),
-                s.b and ('%.0f'):format(s.b) or ('~' .. ((e == 8) and p.dark_burden or p.default_burden)),
+                s.pred and ('%d (stats)'):format(s.pred) or (s.b and ('%.0f'):format(s.b)) or ('~' .. ((e == 8) and p.dark_burden or p.default_burden)),
                 s.exact and '' or '  (estimate)'));
         end
     end
@@ -1336,7 +1468,7 @@ local function tab_overload()
         ui.show_advanced = adv[1];
     end
     if (ui.show_advanced) then
-        TextWrapped('Defaults match the LandSandBoat server code HorizonXI is built on. Only change these if you know your server differs.');
+        TextWrapped('Defaults follow LandSandBoat\'s code for this era as of mid-2026; HorizonXI\'s own values are not confirmed. Only change these if you know your server differs.');
         input_int('Seconds per decay tick', o, 'tick', 1, 10, 120);
         input_int('Base threshold', o, 'base_threshold', 0, 100, 120);
         input_int('Chance offset', o, 'chance_offset', 0, 20, 120);
@@ -1391,7 +1523,7 @@ local function parse_order(s)
             order[#order + 1] = key;
         end
     end
-    for _, key in ipairs({ 'maneuvers', 'abilities', 'recasts' }) do
+    for _, key in ipairs({ 'automaton', 'maneuvers', 'abilities', 'recasts' }) do
         if (not seen[key]) then
             order[#order + 1] = key;
         end
@@ -1427,6 +1559,21 @@ local function tab_appearance()
     combo('Time format', hud, 'time_format', { { 'mss', '1:05 (minutes:seconds)' }, { 'sec', '65s (seconds)' } }, 220);
     combo('Cooldown bars', hud, 'fill_mode', { { 'drain', 'Empty as time passes' }, { 'fill', 'Fill up until ready' } }, 220);
     combo('Sort abilities', hud, 'sort_abilities', { { 'remaining', 'Soonest ready first' }, { 'name', 'By name' } }, 220);
+    local grow_before = hud.grow;
+    combo('New bars appear', hud, 'grow', { { 'down', 'Below (the window grows down)' }, { 'up', 'Above (the bottom edge stays put)' } }, 260);
+    if (imgui.IsItemHovered()) then
+        SetTooltip('Above: park the window just above your chat log, and new bars push its top edge up instead of spilling over the log or off the screen.');
+    end
+    if (hud.grow ~= grow_before) then
+        -- Keep the window where it is: the saved y switches between its top and its bottom edge
+        -- (corrected once the window is drawn, if its height changed meanwhile; see ui.render_hud).
+        local h = ui.hud_h or 0;
+        hud.y = (hud.grow == 'up') and (hud.y + h) or (hud.y - h);
+        ui.grow_fix = { grow = hud.grow, h = h };
+        ui.grow_measured = false;
+        ui.force_pos = true;
+    end
+    checkbox('Hide during cutscenes and NPC conversations', hud, 'hide_in_events', 'The timers keep counting while hidden.');
     checkbox('Show automaton name above the bars', hud, 'show_header');
     checkbox('Gap between sections', hud, 'show_section_gap');
     checkbox('Text shadow', hud, 'text_shadow');
@@ -1453,11 +1600,37 @@ local function tab_appearance()
     end
 
     heading('Colors');
+    if (imgui.Button('Default colours')) then
+        pt.actions.apply_palette('default');
+        set_status('Default colours restored.');
+    end
+    if (imgui.IsItemHovered()) then
+        SetTooltip('Every colour back to its default: the window, the elements and the automaton abilities.');
+    end
+    imgui.SameLine();
+    if (imgui.Button('Colour-blind friendly')) then
+        pt.actions.apply_palette('colorblind');
+        set_status('Colour-blind friendly colours applied.');
+    end
+    if (imgui.IsItemHovered()) then
+        SetTooltip('Colours that stay distinct with the common kinds of colour blindness (the Okabe-Ito set). Overload risk runs blue, yellow, orange, vermillion instead of green to red.');
+    end
+    imgui.SameLine();
+    if (imgui.Button('High contrast')) then
+        pt.actions.apply_palette('contrast');
+        set_status('High contrast colours applied.');
+    end
+    if (imgui.IsItemHovered()) then
+        SetTooltip('Brighter colours on darker, more solid bars.');
+    end
     local c = cfg.colors;
     local entries = {
         { 'bar_bg', 'Bar background' }, { 'text', 'Text' }, { 'header', 'Automaton name' },
         { 'ready', 'READY bars' }, { 'warn', 'Expiring maneuver text' }, { 'recast', 'Job ability bars' },
-        { 'maneuver_cd', 'Maneuver recast bar' }, { 'overload', 'Overload bar' }, { 'empty', 'Empty maneuver slot' },
+        { 'maneuver_cd', 'Maneuver recast bar' }, { 'overload', 'OVERLOADED countdown' }, { 'empty', 'Empty maneuver slot' },
+        { 'overload_safe', 'Overload: no risk' }, { 'overload_low', 'Overload: low risk' },
+        { 'overload_mid', 'Overload: medium risk' }, { 'overload_high', 'Overload: high risk' },
+        { 'marker', 'Overload threshold line' }, { 'pet_hp', 'Automaton HP' }, { 'pet_mp', 'Automaton MP' },
     };
     for i, e in ipairs(entries) do
         push_id('col_' .. e[1]);
@@ -1506,16 +1679,21 @@ local function tab_help()
     imgui.Separator();
     local cmds = {
         { '/pupt', 'Open or close this window' },
-        { '/pupt show | hide', 'Show or hide the timer window' },
+        { '/pupt show | hide | toggle', 'Show or hide the timer window' },
         { '/pupt lock | unlock', 'Lock the timer window in place / allow moving and resizing' },
         { '/pupt test', 'Show sample bars and fire test alerts' },
         { '/pupt clear', 'Clear all running automaton timers' },
         { '/pupt pet <name> | auto', 'Set the automaton name by hand, or go back to auto-detect' },
         { '/pupt player <name> | auto', 'Set your name by hand, or go back to auto-detect' },
         { '/pupt start <ability>', 'Start an ability timer by hand (e.g. /pupt start flashbulb)' },
+        { '/pupt profile [name]', 'List profiles, or load one (handy in a macro)' },
+        { '/pupt profile save <name>', 'Save the current settings as a profile' },
+        { '/pupt profile delete <name>', 'Delete a profile' },
+        { '/pupt copyfrom <character>', 'Copy another character\'s PupTimers settings' },
         { '/pupt resetpos', 'Move the timer window back on screen' },
-        { '/pupt status', 'Print what PupTimers currently detects' },
+        { '/pupt status', 'Version, what PupTimers detects, the automaton setup, the last error' },
         { '/pupt debug', 'Toggle debug messages' },
+        { '/pupt defaults', 'Every setting back to its default' },
     };
     for _, c in ipairs(cmds) do
         TextColored(GOOD, c[1]);
@@ -1529,6 +1707,8 @@ local function tab_help()
     TextWrapped('- "Overall size" on the Appearance tab makes everything bigger or smaller.');
     TextWrapped('- Settings are saved per character automatically.');
     TextWrapped('- If a cooldown looks wrong for your server, change it on the Automaton tab.');
+    TextWrapped('- Any of these commands can go on a key with Ashita\'s /bind command, for example to open this window or hide the timers.');
+    TextWrapped('- PupTimers only reads what your game client already receives. It never sends anything to the server and never acts for you.');
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -1558,6 +1738,138 @@ function ui.render_config(now)
     end
 end
 
+-- Profiles tab: profile names sorted once per read of the profiles file.
+ui.prof_name = { '' };
+ui.ab_all = { false };      -- Automaton tab: list every ability, not only the setup's
+local PROF_NAMES, PROF_SRC = {}, nil;
+local function profile_names(t)
+    if (PROF_SRC ~= t) then
+        PROF_SRC = t;
+        PROF_NAMES = {};
+        for name in pairs(t.list) do
+            PROF_NAMES[#PROF_NAMES + 1] = name;
+        end
+        table.sort(PROF_NAMES);
+    end
+    return PROF_NAMES;
+end
+
+local function tab_profiles()
+    local cfg = pt.settings;
+    local pc = cfg.profiles;
+    TextWrapped('A profile is a saved copy of your PupTimers settings: the look, alerts, tracked abilities and the maneuver and overload options. Profiles are shared by all your characters, so you can save one here and load it on another character. The window position, lock, the way new bars grow, and names always stay with each character.');
+
+    heading('Save');
+    push_width(200);
+    imgui.InputText('##pt_prof_name', ui.prof_name, 32);
+    pop_width();
+    imgui.SameLine();
+    if (imgui.Button('Save current settings as this profile')) then
+        local _, text = pt.actions.profile_save(ui.prof_name[1]);
+        set_status(text);
+    end
+
+    heading('Saved profiles');
+    local t = pt.profiles_read(false);
+    if (pt.profiles_error ~= nil) then
+        TextColored(WARN, 'The profiles file could not be read (' .. pt.profiles_error .. '). It is left as it is.');
+    end
+    local names = profile_names(t);
+    if (#names == 0) then
+        TextDisabled('No profiles yet.');
+    end
+    local now = os.clock();
+    for i, name in ipairs(names) do
+        push_id('prof_' .. i);
+        Text(name .. ((name == pc.last) and '   (loaded last)' or ''));
+        imgui.SameLine(300);
+        if (imgui.SmallButton('Load')) then
+            local _, text = pt.actions.profile_load(name);
+            set_status(text);
+        end
+        imgui.SameLine();
+        local armed = (ui.prof_del == name and now < (ui.prof_del_until or 0));
+        if (imgui.SmallButton(armed and 'Click again to delete' or 'Delete')) then
+            if (armed) then
+                local _, text = pt.actions.profile_delete(name);
+                ui.prof_del = nil;
+                set_status(text);
+            else
+                ui.prof_del, ui.prof_del_until = name, now + 4;
+            end
+        end
+        pop_id();
+    end
+
+    heading('Switch with the automaton\'s frame');
+    checkbox('Load the profile chosen below when the automaton\'s frame changes', pc, 'auto', 'PupTimers reads the frame from the game, so switching frames switches your PupTimers setup with it.');
+    if (not pc.auto) then
+        TextDisabled('Tick the box above to use these.');
+    end
+    for _, f in ipairs(data.frames) do
+        push_id('pf_' .. f.key);
+        local cur = pc.frames[f.key] or '';
+        push_width(220);
+        if (begin_combo(f.name, (cur == '') and '(none)' or cur)) then
+            if (imgui.Selectable('(none)', cur == '')) then
+                pc.frames[f.key] = '';
+                changed();
+            end
+            for _, name in ipairs(names) do
+                if (imgui.Selectable(name, cur == name)) then
+                    pc.frames[f.key] = name;
+                    changed();
+                end
+            end
+            end_combo();
+        end
+        pop_width();
+        pop_id();
+    end
+    if (pt.kit ~= nil and pt.kit.frame_name ~= nil) then
+        TextDisabled('Your automaton\'s frame now: ' .. pt.kit.frame_name);
+    end
+    TextDisabled('Commands: /pupt profile lists them, /pupt profile <name> loads one (handy in a macro).');
+
+    heading('Copy from another character');
+    local others = pt.other_characters();
+    if (#others == 0) then
+        TextDisabled('No other characters with PupTimers settings found.');
+    else
+        local pick = ui.copy_pick;
+        if (pick == nil or others[pick] == nil) then
+            pick = 1;
+            ui.copy_pick = 1;
+        end
+        push_width(200);
+        if (begin_combo('##pt_copy_from', others[pick].name)) then
+            for i, c in ipairs(others) do
+                push_id('cf_' .. i);
+                if (imgui.Selectable(c.name, i == pick)) then
+                    ui.copy_pick = i;
+                end
+                pop_id();
+            end
+            end_combo();
+        end
+        pop_width();
+        imgui.SameLine();
+        local armed = (ui.copy_armed_until ~= nil and os.clock() < ui.copy_armed_until);
+        if (imgui.Button(armed and 'Click again to copy##cpy' or 'Copy their settings##cpy')) then
+            if (armed) then
+                ui.copy_armed_until = nil;
+                local _, text = pt.actions.copy_from(others[pick].name);
+                set_status(text);
+            else
+                ui.copy_armed_until = os.clock() + 4;
+            end
+        end
+        if (imgui.IsItemHovered()) then
+            SetTooltip('Replaces this character\'s PupTimers settings with theirs (look, alerts, abilities, maneuvers, overload). Window position and names stay. Click twice to confirm.');
+        end
+    end
+end
+
 local TABS = {
     { 'General', function () tab_general(); end },
     { 'Automaton', function () tab_automaton(); end },
@@ -1566,6 +1878,7 @@ local TABS = {
     { 'Recasts', function () tab_recasts(); end },
     { 'Appearance', function () tab_appearance(); end },
     { 'Alerts', function () tab_alerts(); end },
+    { 'Profiles', function () tab_profiles(); end },
     { 'Help', function () tab_help(); end },
 };
 

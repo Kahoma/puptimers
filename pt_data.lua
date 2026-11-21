@@ -39,6 +39,16 @@ data.OVERDRIVE_BUFF      = 166;
 data.OVERDRIVE_THRESH    = 5000;  -- Overdrive raises the overload threshold by this much (no overload possible)
 data.MANEUVER_TIMER_ID   = 210;   -- recast timer shared by all eight maneuvers
 data.MAX_MANEUVERS       = 3;     -- the server keeps at most 3; a 4th replaces the oldest
+
+-- The automaton's weapon skills (mob skill ids in its action packets, category 11): Flame Holder
+-- uses up Fire Maneuvers on these. Ice Maker uses up Ice Maneuvers on elemental nukes (spell ids
+-- Fire 144 to Water V 173, category 4).
+data.automaton_ws = {
+    [1940] = 'Chimera Ripper', [1941] = 'String Clipper', [1942] = 'Arcuballista', [1943] = 'Slapstick',
+    [2065] = 'Cannibal Blade', [2066] = 'Daze', [2067] = 'Knockout', [2299] = 'Bone Crusher',
+    [2300] = 'Armor Piercer', [2301] = 'Magic Mortar', [2743] = 'String Shredder', [2744] = 'Armor Shatterer',
+};
+data.NUKE_FIRST, data.NUKE_LAST = 144, 173;
 data.PUP_JOB_ID          = 18;
 
 -- Automaton abilities.
@@ -50,23 +60,85 @@ data.PUP_JOB_ID          = 18;
 --   skill_id : the ability id carried by the action packet (category 11)
 --   aliases  : other spellings accepted by "/pupt start <name>"
 --   spawn_cooldown : cooldown the server applies when the automaton is activated, if different
+--   att      : the attachment's byte in the game's setup data (packet 0x044), if it comes from one
+--   frame    : the frame byte, for frame abilities (Shield Bash: Valoredge)
+--   horizon  : false for abilities whose attachment is not on HorizonXI (hidden unless asked for)
+--   consumes : the attachment uses up all maneuvers of its element when it fires ('all': every
+--              maneuver, as Eraser does on this era's server code)
 data.abilities = {
-    { key = 'provoke',         name = 'Provoke',         cooldown = 30,  element = 'fire',  source = 'Strobe / Strobe II',             skill_id = 1945 },
-    { key = 'eraser',          name = 'Eraser',          cooldown = 30,  element = 'light', source = 'Eraser',                         skill_id = 2021 },
-    { key = 'flashbulb',       name = 'Flashbulb',       cooldown = 45,  element = 'light', source = 'Flashbulb',                      skill_id = 1947 },
-    { key = 'reactive_shield', name = 'Reactive Shield', cooldown = 65,  element = 'fire',  source = 'Reactive Shield (65s on 2020-2026 server code; current LandSandBoat uses 60s)', skill_id = 2031 },
-    { key = 'replicator',      name = 'Replicator',      cooldown = 60,  element = 'wind',  source = 'Replicator',                     skill_id = 2132 },
-    { key = 'disruptor',       name = 'Disruptor',       cooldown = 60,  element = 'dark',  source = 'Disruptor',                      skill_id = 2747 },
-    { key = 'regulator',       name = 'Regulator',       cooldown = 60,  element = 'dark',  source = 'Regulator',                      skill_id = 3485 },
-    { key = 'heat_capacitor',  name = 'Heat Capacitor',  cooldown = 90,  element = 'fire',  source = 'Heat Capacitor / II',            skill_id = 2745 },
-    { key = 'shock_absorber',  name = 'Shock Absorber',  cooldown = 180, element = 'earth', source = 'Shock Absorber / II / III',      skill_id = 1946 },
-    { key = 'mana_converter',  name = 'Mana Converter',  cooldown = 180, element = 'dark',  source = 'Mana Converter (fires at low automaton MP with Dark Maneuvers up)', skill_id = 1948, aliases = { 'Mana-Converter', 'Mana Convertor' }, color = { 0.33, 0.45, 0.92, 1.0 } },
-    { key = 'economizer',      name = 'Economizer',      cooldown = 180, element = 'dark',  source = 'Economizer (fires at low automaton MP with Dark Maneuvers up)',     skill_id = 2068, aliases = { 'Economiser' }, spawn_cooldown = 60, color = { 0.68, 0.32, 0.80, 1.0 } },
-    { key = 'barrage_turbine', name = 'Barrage Turbine', cooldown = 180, element = 'wind',  source = 'Barrage Turbine',                skill_id = 2746 },
-    { key = 'shield_bash',     name = 'Shield Bash',     cooldown = 180, element = nil,     source = 'Valoredge Frame (Barrier Module lowers it 5/10/15s)', skill_id = 1944 },
+    { key = 'provoke',         name = 'Provoke',         cooldown = 30,  element = 'fire',  source = 'Strobe',                         skill_id = 1945, att = 1 },
+    { key = 'eraser',          name = 'Eraser',          cooldown = 30,  element = 'light', source = 'Eraser (uses up your maneuvers: all of them on current server code, Light ones on older code)', skill_id = 2021, att = 197, consumes = 'all' },
+    { key = 'flashbulb',       name = 'Flashbulb',       cooldown = 45,  element = 'light', source = 'Flashbulb',                      skill_id = 1947, att = 194 },
+    { key = 'reactive_shield', name = 'Reactive Shield', cooldown = 60,  element = 'fire',  source = 'Reactive Shield (60s on current server code and the HorizonXI wiki; 65s on older code)', skill_id = 2031, att = 6 },
+    { key = 'replicator',      name = 'Replicator',      cooldown = 60,  element = 'wind',  source = 'Replicator (uses up your Wind Maneuvers)', skill_id = 2132, att = 71, consumes = true },
+    { key = 'shock_absorber',  name = 'Shock Absorber',  cooldown = 180, element = 'earth', source = 'Shock Absorber',                 skill_id = 1946, att = 97 },
+    { key = 'mana_converter',  name = 'Mana Converter',  cooldown = 180, element = 'dark',  source = 'Mana Converter (fires at low automaton MP with Dark Maneuvers up)', skill_id = 1948, att = 226, aliases = { 'Mana-Converter', 'Mana Convertor' }, color = { 0.33, 0.45, 0.92, 1.0 } },
+    { key = 'economizer',      name = 'Economizer',      cooldown = 180, element = 'dark',  source = 'Economizer (fires at low automaton MP with Dark Maneuvers up; uses them up)', skill_id = 2068, att = 230, consumes = true, aliases = { 'Economiser' }, spawn_cooldown = 60, color = { 0.68, 0.32, 0.80, 1.0 } },
+    { key = 'shield_bash',     name = 'Shield Bash',     cooldown = 180, element = nil,     source = 'Valoredge Frame',                skill_id = 1944, frame = 0x21 },
+    -- Not obtainable on HorizonXI (no wiki page or hidden): kept for other servers.
+    { key = 'disruptor',       name = 'Disruptor',       cooldown = 60,  element = 'dark',  source = 'Disruptor (not on HorizonXI)',      skill_id = 2747, horizon = false },
+    { key = 'regulator',       name = 'Regulator',       cooldown = 60,  element = 'dark',  source = 'Regulator (not on HorizonXI)',      skill_id = 3485, horizon = false },
+    { key = 'heat_capacitor',  name = 'Heat Capacitor',  cooldown = 90,  element = 'fire',  source = 'Heat Capacitor (not obtainable on HorizonXI)', skill_id = 2745, horizon = false, consumes = true },
+    { key = 'barrage_turbine', name = 'Barrage Turbine', cooldown = 180, element = 'wind',  source = 'Barrage Turbine (not obtainable on HorizonXI)', skill_id = 2746, horizon = false },
 };
 
+-- Automaton attachments on HorizonXI, by their byte in the setup data (item id = 0x2100 + byte).
+data.attachments = {
+    [1] = 'Strobe', [2] = 'Tension Spring', [3] = 'Inhibitor', [4] = 'Tension Spring II', [5] = 'Attuner',
+    [6] = 'Reactive Shield', [7] = 'Flame Holder',
+    [33] = 'Mana Booster', [34] = 'Loudspeaker', [35] = 'Scanner', [36] = 'Loudspeaker II',
+    [37] = 'Tactical Processor', [38] = 'Tranquilizer', [39] = 'Ice Maker',
+    [65] = 'Accelerator', [66] = 'Scope', [67] = 'Pattern Reader', [68] = 'Accelerator II',
+    [69] = 'Drum Magazine', [70] = 'Turbo Charger', [71] = 'Replicator',
+    [97] = 'Shock Absorber', [98] = 'Armor Plate', [99] = 'Analyzer', [100] = 'Armor Plate II',
+    [101] = 'Equalizer', [102] = 'Schurzen', [103] = 'Hammermill',
+    [129] = 'Stabilizer', [130] = 'Volt Gun', [131] = 'Heat Seeker', [132] = 'Stabilizer II',
+    [133] = 'Target Marker', [134] = 'Dynamo', [135] = 'Coiler',
+    [161] = 'Mana Jammer', [162] = 'Heatsink', [163] = 'Stealth Screen', [164] = 'Mana Jammer II',
+    [165] = 'Mana Channeler', [166] = 'Condenser', [167] = 'Steam Jacket',
+    [193] = 'Auto-Repair Kit', [194] = 'Flashbulb', [195] = 'Damage Gauge', [196] = 'Auto-Repair Kit II',
+    [197] = 'Eraser', [198] = 'Optic Fiber',
+    [225] = 'Mana Tank', [226] = 'Mana Converter', [227] = 'Mana Conserver', [228] = 'Mana Tank II',
+    [229] = 'Smoke Screen', [230] = 'Economizer',
+};
+-- The attachments PupTimers acts on.
+data.ATT = {
+    flame_holder = 7, tactical_processor = 37, ice_maker = 39, replicator = 71, schurzen = 102,
+    heatsink = 162, condenser = 166, damage_gauge = 195, optic_fiber = 198, economizer = 230,
+    mana_converter = 226,
+};
+
+data.heads = {
+    [1] = 'Harlequin Head', [2] = 'Valoredge Head', [3] = 'Sharpshot Head', [4] = 'Stormwaker Head',
+    [5] = 'Soulsoother Head', [6] = 'Spiritreaver Head',
+};
+
+-- Automaton Oil in the ammo slot is what Repair uses (one per use).
+data.oils = { [18731] = 'Oil', [18732] = 'Oil+1', [18733] = 'Oil+2', [19185] = 'Oil+3' };
+
 data.SHIELD_BASH_COLOR = { 0.62, 0.68, 0.76, 1.0 };
+
+-- Automaton frames (for switching settings profiles with the frame).
+data.frames = {
+    { key = 'harlequin',  name = 'Harlequin Frame',  byte = 0x20 },
+    { key = 'valoredge',  name = 'Valoredge Frame',  byte = 0x21 },
+    { key = 'sharpshot',  name = 'Sharpshot Frame',  byte = 0x22 },
+    { key = 'stormwaker', name = 'Stormwaker Frame', byte = 0x23 },
+};
+data.frame_by_byte = {};
+for _, f in ipairs(data.frames) do
+    data.frame_by_byte[f.byte] = f;
+end
+
+-- Shorter names for narrow windows (used only when the full name does not fit).
+data.short_names = {
+    ['Reactive Shield'] = 'R. Shield', ['Replicator'] = 'Replic.', ['Disruptor'] = 'Disrupt.',
+    ['Regulator'] = 'Regul.', ['Heat Capacitor'] = 'Heat Cap.', ['Shock Absorber'] = 'Shock Abs.',
+    ['Mana Converter'] = 'Mana Conv.', ['Economizer'] = 'Econ.', ['Barrage Turbine'] = 'Barrage',
+    ['Shield Bash'] = 'S. Bash', ['Deus Ex Automata'] = 'Deus Ex', ['Deactivate'] = 'Deact.',
+    ['Role Reversal'] = 'Role Rev.', ['Ventriloquy'] = 'Ventril.', ['Tactical Switch'] = 'Tac. Switch',
+    ['Maintenance'] = 'Maint.',
+};
 
 -- Automaton actions that have no cooldown of their own (TP weapon skills, ranged attacks).
 -- They are never offered as "seen but not tracked" in the settings window.
@@ -86,13 +158,14 @@ data.overload_gear = {
     { key = 'puppetry_dastanas_p1', name = 'Puppetry Dastanas +1', ids = { 15030 }, slot = 'hands', thresh = 5, effect = '+5 overload threshold' },
     { key = 'buffoons_collar',      name = 'Buffoon\'s Collar',    ids = { 16281 }, slot = 'neck',  thresh = 5, effect = '+5 overload threshold' },
     { key = 'buffoons_collar_p1',   name = 'Buffoon\'s Collar +1', ids = { 16282 }, slot = 'neck',  thresh = 5, effect = '+5 overload threshold' },
-    { key = 'kenkonken',            name = 'Kenkonken',            ids = { 19008 }, slot = 'main',  suppress = true, effect = 'burden from each maneuver divided by 3' },
+    { key = 'kenkonken',            name = 'Kenkonken',            ids = { 19008 }, slot = 'main',  suppress = true, effect = 'every burden gain divided by 3 (maneuvers and activation)' },
 };
 
--- Attachments can't be read from the game, so they are ticked by hand.
+-- Attachments that change overload. Read from the game's setup data, or ticked by hand.
+-- (Tactical Processor is not here: its -5 threshold sits on the automaton on this era's server
+-- code, and the overload check only reads the master's threshold.)
 data.overload_attachments = {
-    { key = 'heatsink',           name = 'Heatsink',           effect = 'burden cools 3/5/6/7 per tick with 0/1/2/3 Water Maneuvers up' },
-    { key = 'tactical_processor', name = 'Tactical Processor', effect = 'threshold -5 (only on servers using the pre-2015 rule)' },
+    { key = 'heatsink',           name = 'Heatsink',           effect = 'burden cools faster (see the Heatsink setting)' },
 };
 
 data.job_names = {
@@ -111,8 +184,8 @@ data.job_abilities = {
     { key = 'deus_ex_automata', name = 'Deus Ex Automata', timer = 115,  recast = 60,   show = true,  alert = true,  spawns = true },
     { key = 'repair',           name = 'Repair',           timer = 206,  recast = 180,  show = true,  alert = true  },
     { key = 'deactivate',       name = 'Deactivate',       timer = 208,  recast = 60,   show = false, alert = false },
-    { key = 'deploy',           name = 'Deploy',           timer = 207,  recast = 5,    show = false, alert = false },
-    { key = 'retrieve',         name = 'Retrieve',         timer = 209,  recast = 5,    show = false, alert = false },
+    { key = 'deploy',           name = 'Deploy',           timer = 207,  recast = 10,   show = false, alert = false },
+    { key = 'retrieve',         name = 'Retrieve',         timer = 209,  recast = 10,   show = false, alert = false },
     { key = 'role_reversal',    name = 'Role Reversal',    timer = 211,  recast = 120,  show = false, alert = false },
     { key = 'ventriloquy',      name = 'Ventriloquy',      timer = 212,  recast = 60,   show = false, alert = false },
     { key = 'tactical_switch',  name = 'Tactical Switch',  timer = 213,  recast = 180,  show = false, alert = false },
@@ -135,7 +208,7 @@ function data.default_settings()
     end
 
     local s = {
-        version = 1,
+        version = 2,
 
         hud = {
             visible             = true,
@@ -150,6 +223,9 @@ function data.default_settings()
             rounding            = 3,
             bg_alpha            = 0.55,
             hide_when_empty     = true,
+            hide_in_events      = true,    -- hide the timers during cutscenes and NPC conversations (they keep counting)
+            grow                = 'down',  -- 'down': x/y is the top-left corner and new bars go below;
+                                           -- 'up': x/y is the bottom-left corner and the window grows upward
             only_on_pup         = true,
             preview_unlocked    = true,    -- show sample bars while unlocked and idle
             show_header         = false,   -- automaton name line above the bars
@@ -158,7 +234,7 @@ function data.default_settings()
             fill_mode           = 'drain', -- 'drain' (bar empties) or 'fill' (bar fills up)
             time_format         = 'mss',   -- 'mss' (1:05) or 'sec' (65s)
             sort_abilities      = 'remaining', -- 'remaining' or 'name'
-            order               = 'maneuvers,abilities,recasts',
+            order               = 'automaton,maneuvers,abilities,recasts',
         },
 
         colors = {
@@ -176,6 +252,22 @@ function data.default_settings()
             overload_mid  = { 0.95, 0.52, 0.12, 1.00 },
             overload_high = { 0.90, 0.16, 0.14, 1.00 },
             marker        = { 1.00, 1.00, 1.00, 0.85 },
+            pet_hp        = { 0.32, 0.76, 0.42, 1.00 },
+            pet_mp        = { 0.32, 0.55, 0.95, 1.00 },
+        },
+
+        automaton = {
+            show_hp   = false,  -- thin automaton HP bar (off by default: other addons often show one)
+            show_mp   = false,  -- thin automaton MP bar
+            repair_at = 0,      -- remind to Repair when the automaton's HP falls to this % and Repair is ready (0 = off)
+            deactivate_hint = true, -- while Activate cools down: say when Deactivate would reset it (automaton at full HP)
+            oil       = true,   -- show the Automaton Oil in the ammo slot on the Repair bar, warn when there is none
+        },
+
+        profiles = {
+            auto   = false,  -- load the profile chosen for the automaton's frame when the frame changes
+            frames = { harlequin = '', valoredge = '', sharpshot = '', stormwaker = '' },
+            last   = '',     -- the profile loaded last (shown in the Profiles tab)
         },
 
         names = {
@@ -199,13 +291,18 @@ function data.default_settings()
             icon_glyphs  = true,    -- draw element symbols on the icons (false = letters)
             icon_align   = 'left',  -- 'left' or 'center'
             duration     = 60,      -- maneuver duration (a flat 60s on HorizonXI)
-            real_timers  = false,   -- use the game's buff timers for every maneuver (only if your server changes durations);
-                                    -- maneuvers already up when the addon loads always use them
+            timer_mode   = 'auto',  -- 'auto': start + duration, but switch to the game's buff timers once a
+                                    -- maneuver lasts longer (servers that lengthen them in battle);
+                                    -- 'game': always the game's buff timers; 'flat': always start + duration.
+                                    -- Maneuvers already up when the addon loads always use the game's timers.
             show_empty   = false,  -- show empty slots while the automaton is out
             show_recast  = true,   -- show the shared maneuver recast bar
             show_overload = true,
             warn_at      = 10,     -- seconds left when a maneuver bar turns orange (0 = off)
             alert_wear   = false,  -- chat/sound alert when a maneuver wears off
+            show_unpowered = true, -- a line naming equipped abilities that cannot fire for lack of their maneuver
+            alert_unpowered = false, -- chat/sound alert when losing a maneuver leaves such an ability unpowered
+            explain_used = true,   -- a chat line when an attachment uses up maneuvers (Economizer, Replicator ...)
             colors       = {},     -- element key -> color (filled below)
         },
 
@@ -221,13 +318,18 @@ function data.default_settings()
             base_threshold     = 30,     -- burden above this can overload
             chance_offset      = 5,      -- reported chance = burden - threshold + 5
             base_decay         = 1,      -- burden lost per tick
-            default_burden     = 20,     -- burden per maneuver until learned (15, or 20 when your stat is below the automaton's)
-            dark_burden        = 15,     -- Dark Maneuver (10, or 15 when your MP is below the automaton's)
-            spawn_burden       = 30,     -- burden in every element when an automaton is activated / respawns after zoning
+            default_burden     = 20,     -- burden per maneuver until known (14-20 by your stat against the automaton's)
+            dark_burden        = 15,     -- Dark Maneuver until known (8 or 14 by frame on current server code)
+            spawn_burden       = 35,     -- burden in every element when an automaton is activated / respawns after zoning
+                                         -- (35 on current server code, 30 on older code)
+            use_stats          = true,   -- work out each maneuver's burden from your and the automaton's stats
+                                         -- (used once the game's own reports show it is right)
+            heatsink_decay     = 1,      -- Heatsink: extra cooling per tick (current server code for this era: +1)
+            heatsink_by_water  = false,  -- older server rule: +2/+4/+5/+6 with 0/1/2/3 Water Maneuvers instead
+            attachments_auto   = true,   -- take Heatsink / Tactical Processor from the game's setup data
             -- Gear and attachments (one entry per item, filled below from data.overload_gear)
             gear               = {},     -- key -> { count = bool, worn_only = bool }
-            heatsink           = false,  -- Heatsink attachment equipped
-            tactical_processor = false,  -- Tactical Processor attachment equipped
+            heatsink           = false,  -- Heatsink attachment equipped (by hand, if the setup is not read)
             extra_threshold    = 0,      -- manual adjustment
             extra_decay        = 0,      -- manual adjustment
             alert_risk         = 0,      -- chat/sound warning when a maneuver would be this risky (0 = off)
@@ -279,6 +381,77 @@ function data.default_settings()
     end
 
     return s;
+end
+
+--[[
+* Colour schemes. 'default' is the defaults above; the others replace the window colours, the
+* element colours and the automaton ability colours (abilities take their element's colour, the
+* MP abilities and Shield Bash get their own).
+--]]
+local function rgb(hex, a)
+    return { tonumber(hex:sub(1, 2), 16) / 255, tonumber(hex:sub(3, 4), 16) / 255, tonumber(hex:sub(5, 6), 16) / 255, a or 1.0 };
+end
+
+data.palettes = {
+    -- Okabe-Ito colours: told apart with every common kind of colour blindness. Risk goes from blue
+    -- through yellow and orange to vermillion, never red against green.
+    colorblind = {
+        name = 'Colour-blind friendly',
+        colors = {
+            ready = rgb('56B4E9'), warn = rgb('E69F00'), recast = rgb('E69F00'), maneuver_cd = rgb('999999'),
+            overload = rgb('D55E00'), overload_safe = rgb('56B4E9'), overload_low = rgb('F0E442'),
+            overload_mid = rgb('E69F00'), overload_high = rgb('D55E00'), marker = rgb('FFFFFF', 0.9),
+            pet_hp = rgb('009E73'), pet_mp = rgb('0072B2'),
+        },
+        elements = {
+            fire = rgb('D55E00'), ice = rgb('56B4E9'), wind = rgb('009E73'), earth = rgb('E69F00'),
+            thunder = rgb('CC79A7'), water = rgb('0072B2'), light = rgb('F0E442'), dark = rgb('8C8C8C'),
+        },
+        special = { mana_converter = rgb('0072B2'), economizer = rgb('CC79A7'), shield_bash = rgb('BBBBBB') },
+    },
+    -- Brighter, fully saturated colours on a darker, more solid bar background.
+    contrast = {
+        name = 'High contrast',
+        colors = {
+            bar_bg = { 0.02, 0.02, 0.03, 0.95 }, text = { 1, 1, 1, 1 }, header = { 1, 1, 1, 1 },
+            ready = rgb('30D158'), warn = rgb('FF9F0A'), recast = rgb('FFD60A'), maneuver_cd = rgb('AEAEB2'),
+            overload = rgb('FF453A'), empty = { 0.45, 0.45, 0.50, 0.75 }, overload_safe = rgb('30D158'),
+            overload_low = rgb('FFD60A'), overload_mid = rgb('FF9F0A'), overload_high = rgb('FF453A'),
+            marker = rgb('FFFFFF'), pet_hp = rgb('30D158'), pet_mp = rgb('0A84FF'),
+        },
+        elements = {
+            fire = rgb('FF453A'), ice = rgb('64D2FF'), wind = rgb('30D158'), earth = rgb('D4A84B'),
+            thunder = rgb('BF5AF2'), water = rgb('0A84FF'), light = rgb('FFF59D'), dark = rgb('9E9EA6'),
+        },
+        special = { mana_converter = rgb('0A84FF'), economizer = rgb('BF5AF2'), shield_bash = rgb('D1D1D6') },
+    },
+};
+
+--[[
+* The colours of a scheme as { colors = {...}, elements = {...}, abilities = {...} }, every value a
+* new table. 'default' (or an unknown name) gives the default colours.
+--]]
+function data.palette(name)
+    local d = data.default_settings();
+    local out = { colors = d.colors, elements = d.maneuvers.colors, abilities = {} };
+    for key, a in pairs(d.abilities) do
+        out.abilities[key] = a.color;
+    end
+    local p = data.palettes[name];
+    if (p == nil) then
+        return out;
+    end
+    for k, v in pairs(p.colors) do
+        out.colors[k] = { v[1], v[2], v[3], v[4] };
+    end
+    for k, v in pairs(p.elements) do
+        out.elements[k] = { v[1], v[2], v[3], v[4] };
+    end
+    for _, a in ipairs(data.abilities) do
+        local c = p.special[a.key] or (a.element ~= nil and p.elements[a.element]) or p.special.shield_bash;
+        out.abilities[a.key] = { c[1], c[2], c[3], c[4] };
+    end
+    return out;
 end
 
 return data;
