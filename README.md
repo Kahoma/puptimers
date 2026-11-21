@@ -18,16 +18,6 @@ A small, movable, resizable timer window for Puppetmaster:
 
 PupTimers only reads data the game client already has. It never sends anything to the server and
 never performs an action for you.
-
----
-
-## ⚠️ Before you use it on HorizonXI
-
-HorizonXI only allows addons on its **approved list**, and using one that is not approved can get
-an account banned. Custom or modified addons have to be published and approved as new addons.
-**Get PupTimers approved by HorizonXI staff before loading it on your live account** (check the
-HorizonXI website / Discord for the current approved list and how to submit an addon).
-
 ---
 
 ## Install
