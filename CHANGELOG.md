@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.1.1
+
+A review of safety, resource use, bugs and ease of use. PupTimers still only reads what the game
+client already has: it never sends, changes or blocks a packet, only keeps its own `/pupt` command
+from reaching the game, and never acts for you.
+
+### Fixed
+
+- A job ability's "is ready" alert was lost when its recast ended during a loading screen.
+- Turning off "Show maneuvers" also hid the overload bars, the OVERLOADED countdown and the
+  Unpowered line; they now follow their own options.
+- "X is ready!" was announced for an ability turned off while its bar was running.
+- The Repair reminder ignores an automaton at 0% HP.
+- On Ashita 4.3, the game clock was not found and buff end times used the PC clock instead.
+
+### Easier to use
+
+- The first-run sample bars are headed "Sample bars (/pupt lock)", the first-run hint says so, and
+  it is shown again for each character you log in with.
+- `/pupt lock`, `unlock`, `show`, `hide` and `toggle` say what happened. `/pupt unlock` on another
+  job opens the settings window, where the timer window can be placed. `/pupt status` shows whether
+  the window is shown and locked.
+- Commands with a missing name show how to use them. `/pupt pet` and `/pupt player` alone show the
+  current name instead of clearing it. `/pupt start` says when the ability is turned off, and
+  `/pupt test` says when the timer window is hidden.
+- Profile names work in any capitals: loading, deleting, and saving over a profile (saving "tank"
+  updates "Tank" instead of adding a second profile).
+- Narrow windows keep their meaning: the Repair bar keeps the oil ("Repair (Oil+1 x6)"), the
+  Unpowered line names the missing maneuvers ("Needs Fire, Light") and the Deactivate hint reads
+  "Deactivating resets Activate".
+- The maneuver recast bar is labelled "Next maneuver".
+- Restoring the default cooldowns and colours, restoring the overload defaults, resetting the
+  overload estimate and choosing a colour scheme ask for a second click, like "Reset all settings",
+  deleting a profile and copying settings already did.
+- The Flame Holder and Ice Maker notes are shown once per session.
+- The maneuver duration is a typed number (a stray click on a slider could change it). Numbers
+  typed in the settings window are stored when you press Enter or click elsewhere, so a half-typed
+  value (the "6" of "65") never reaches the timers. "Extra threshold" and "Extra decay" moved under
+  "Show server constants", and "Restore overload defaults" also resets them and the two Heatsink
+  cooling options.
+- Clearer wording: "Read the game's combat data", the Alerts tab says it covers every alert, the
+  Automaton tab warns when chat reading is off (abilities you add need it), and "colour" is spelt
+  the same everywhere.
+
+### Lighter and safer
+
+- Closing the settings window writes the settings only when something changed.
+- The settings window no longer rebuilds its fixed tables every frame.
+- An error inside a `/pupt` command is reported in one plain line, like errors elsewhere.
+- Code cleanup with no change in behaviour: the game reading is split into named steps, repeated
+  code is shared, and unused code and fields are gone.
+
 ## 1.1.0
 
 ### New

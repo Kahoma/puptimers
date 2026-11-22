@@ -76,7 +76,7 @@ function ov.set_suppress(st, suppress)
 end
 
 function ov.new()
-    local st = { el = {}, overload_el = nil, overload_until = nil, reports = 0, unknown_since = nil };
+    local st = { el = {}, overload_until = nil, reports = 0, unknown_since = nil };
     for e = 1, 8 do
         st.el[e] = {
             burden = 0,       -- burden at time t
@@ -152,17 +152,13 @@ function ov.burden(st, e, now, p)
     return v;
 end
 
+-- The burden a maneuver of element e adds before anything is learned (Dark has its own value).
+function ov.base_burden(e, p)
+    return (e == 8) and p.dark_burden or p.default_burden;
+end
+
 local function per_maneuver(s, e, p)
-    if (s.pred ~= nil) then
-        return s.pred;
-    end
-    if (s.b ~= nil) then
-        return s.b;
-    end
-    if (e == 8) then
-        return p.dark_burden;
-    end
-    return p.default_burden;
+    return s.pred or s.b or ov.base_burden(e, p);
 end
 
 -- Chance the game would report for a burden value (0 when not above threshold - offset).
@@ -186,11 +182,9 @@ end
 
 --[[
 * A maneuver of element e was used.
-* @param report - { chance = n, overloaded = bool } from the server, or nil if none was seen
---]]
---[[
-* era / classic: the burden this maneuver adds by the two server rules, worked out from stats at the
-* moment it was used (nil when not known); they are scored against the game's reports.
+* @param report  - { chance = n, overloaded = bool } from the server, or nil if none was seen
+* @param era, classic - the burden this maneuver adds by the two server rules, worked out from stats
+*                  at the moment it was used (nil when not known); scored against the game's reports
 --]]
 function ov.on_maneuver(st, e, now, p, report, era, classic)
     local s = st.el[e];
@@ -200,7 +194,7 @@ function ov.on_maneuver(st, e, now, p, report, era, classic)
     local before = ov.burden(st, e, now, p);
     -- Remember the state before this maneuver so a report arriving a moment later can be matched.
     s.pending = { time = now, before = before, was_exact = s.exact, was_used = s.used,
-                  learned = (s.b ~= nil) and s.b or ((e == 8) and p.dark_burden or p.default_burden),
+                  learned = s.b or ov.base_burden(e, p),
                   era = era, classic = classic };
     s.burden = math.min(255, before + per_maneuver(s, e, p));
     s.t = now;
@@ -260,7 +254,6 @@ function ov.on_report(st, e, now, p, chance, overloaded)
     s.touched = true;
     s.pending = nil;
     if (overloaded) then
-        st.overload_el = e;
         st.overload_until = now + math.max(0, s.burden - T);   -- no overload is possible during Overdrive
     end
 end
@@ -281,7 +274,6 @@ function ov.on_spawn(st, now, p)
         s.used = (v > 0);
         s.touched = false;
     end
-    st.overload_el = nil;
     st.overload_until = nil;
     st.unknown_since = nil;
 end
@@ -310,18 +302,6 @@ function ov.overload_left(st, now)
     return left;
 end
 
---[[
-* Rows for the timer window.
-*   show    'all' (default): one bar for every element whose overload is active; 'top': only the riskiest
-*   hide_at 'chance' (default): an element's bar disappears when its overload chance reaches 0%
-*           'burden': it stays until the burden has fully cooled (so the next-maneuver risk stays visible)
-*   fill    chance mode: chance / full_at (default 50%), so the bar empties exactly as it disappears
-*           burden mode: burden / (threshold + 20), with a white marker at the threshold
-*   colour  'risk' (default): by the chance of the next maneuver of that element; 'element': element colour
-* Burden that only comes from activating the automaton (every element at 30) is shown once as "all".
-* During Overdrive nothing can overload, so the bars show the chances that apply once it ends
-* ("after OD").
---]]
 local function by_risk(a, b)
     if (a.risk ~= b.risk) then
         return a.risk > b.risk;
@@ -347,6 +327,18 @@ function ov.after_overdrive(p)
     return AFTER_OD;
 end
 
+--[[
+* Rows for the timer window.
+*   show    'all' (default): one bar for every element whose overload is active; 'top': only the riskiest
+*   hide_at 'chance' (default): an element's bar disappears when its overload chance reaches 0%
+*           'burden': it stays until the burden has fully cooled (so the next-maneuver risk stays visible)
+*   fill    chance mode: chance / full_at (default 50%), so the bar empties exactly as it disappears
+*           burden mode: burden / (threshold + 20), with a white marker at the threshold
+*   colour  'risk' (default): by the chance of the next maneuver of that element; 'element': element colour
+* Burden that only comes from activating the automaton (every element at the spawn burden) is shown once as "all".
+* During Overdrive nothing can overload, so the bars show the chances that apply once it ends
+* ("after OD").
+--]]
 function ov.rows(st, now, p, cfg)
     local o = cfg.overload;
     local od = (p.overdrive == true);

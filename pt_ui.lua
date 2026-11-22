@@ -10,6 +10,7 @@
 local imgui = require('imgui');
 local data  = require('pt_data');
 local core  = require('pt_core');
+local ovm   = require('pt_overload');
 
 --[[
 * Text output. Ashita 4.16 and older (ImGui 1.80) hand these strings to ImGui as printf formats, so a
@@ -337,21 +338,13 @@ local function draw_text(dl, x, y, s, col_u32, shadow_u32)
 end
 
 -- A bar's fill this frame: from its end time when it has one (smooth between row rebuilds).
+local fill_frac = core.fill_frac;
 local function live_frac(item, now)
     local e = item.dyn_end;
     if (e == nil) then
         return clamp(item.frac, 0, 1);
     end
-    local total = item.dyn_total or 0;
-    if (total <= 0) then
-        return (item.dyn_mode == 'fill') and 1 or 0;
-    end
-    local f = (e - now) / total;
-    if (f < 0) then f = 0; elseif (f > 1) then f = 1; end
-    if (item.dyn_mode == 'fill') then
-        return 1 - f;
-    end
-    return f;
+    return fill_frac(e - now, item.dyn_total, item.dyn_mode);
 end
 
 local function pulse(now)
@@ -679,6 +672,7 @@ local function build_view(now, cfg, unlocked, testing)
     ENV.pet_hp_marks       = pt.game.pet_hp_marks;
     ENV.deactivate_hint    = pt.game.deactivate_hint;
     ENV.repair_label       = pt.game.repair_label;
+    ENV.repair_short       = pt.game.repair_short;
     ENV.man_counts         = pt.game.man_counts;
     ENV.unpowered_text     = pt.game.unpowered_text;
     ENV.unpowered_short    = pt.game.unpowered_short;
@@ -956,17 +950,56 @@ local function slider_int(label, tbl, key, lo, hi, fmt, tip)
     return c;
 end
 
+-- A typed number is stored when its field is left (Enter, Tab, a click elsewhere, or letting go of
+-- its +/- button), not on every keystroke: on the way to "65" the field holds "6", and that must
+-- never reach the settings (a 10 s maneuver duration would rewrite the running maneuvers).
+-- INT_EDITS[tbl][key] = { buf = { n }, frame = f } while that field is being edited. Each field has
+-- its own, so clicking from one field straight into another stores the first. An edit whose field
+-- was not drawn in the previous frame (window closed) is dropped, as ImGui drops it.
+local INT_EDITS = setmetatable({}, { __mode = 'k' });
+ui.frame = 0;   -- counts every frame (ui.render), drawn or not
+
 local function input_int(label, tbl, key, lo, hi, width)
-    local v = W_INT;
-    v[1] = math.floor(clamp(tbl[key], lo, hi));
-    push_width(width or 100);
-    local c = imgui.InputInt(label, v, 1, 10);
-    pop_width();
-    if (c) then
-        tbl[key] = math.floor(clamp(v[1], lo, hi));
-        changed();
+    local edits = INT_EDITS[tbl];
+    local ed = edits and edits[key];
+    if (ed ~= nil and ed.frame < ui.frame - 1) then
+        edits[key], ed = nil, nil;
     end
-    return c;
+    local v;
+    if (ed ~= nil) then
+        v = ed.buf;
+    else
+        v = W_INT;
+        v[1] = math.floor(clamp(tbl[key], lo, hi));
+    end
+    local shown = v[1];
+    push_width(width or 100);
+    imgui.InputInt(label, v, 1, 10);
+    pop_width();
+    if (imgui.IsItemActive()) then
+        if (ed == nil) then
+            if (edits == nil) then
+                edits = {};
+                INT_EDITS[tbl] = edits;
+            end
+            ed = { buf = { v[1] } };
+            edits[key] = ed;
+        end
+        ed.frame = ui.frame;
+        return false;
+    end
+    if (ed ~= nil) then
+        edits[key] = nil;   -- the field was left: store what was typed
+    elseif (v[1] == shown) then
+        return false;
+    end
+    local n = math.floor(clamp(v[1], lo, hi));
+    if (n == tbl[key]) then
+        return false;
+    end
+    tbl[key] = n;
+    changed();
+    return true;
 end
 
 local function color_edit(label, tbl, key, compact)
@@ -1006,6 +1039,32 @@ local function combo(label, tbl, key, options, width)
     pop_width();
 end
 
+--[[
+* A button for something that cannot be undone: the first click arms it (its label asks for a second
+* click), a second click within 4 seconds confirms. One button is armed at a time. Returns true on
+* the confirming click. id is unique per button (e.g. 'del_' .. profile name).
+--]]
+local CONFIRM_FOR = 4.0;
+local function confirm_button(id, label, armed_label, small)
+    local now = os.clock();
+    local armed = (ui.armed_id == id and now < (ui.armed_until or 0));
+    local text = (armed and armed_label or label) .. '##' .. id;
+    local clicked;
+    if (small) then
+        clicked = imgui.SmallButton(text);
+    else
+        clicked = imgui.Button(text);
+    end
+    if (clicked) then
+        if (armed) then
+            ui.armed_id = nil;
+            return true;
+        end
+        ui.armed_id, ui.armed_until = id, now + CONFIRM_FOR;
+    end
+    return false;
+end
+
 local function heading(text)
     imgui.Spacing();
     TextColored(HEAD, text);
@@ -1016,11 +1075,77 @@ function ui.sync_buffers()
     local cfg = pt.settings;
     ui.buf.player = { cfg.names.player or '' };
     ui.buf.pet = { cfg.names.pet or '' };
+    for tbl in pairs(INT_EDITS) do
+        INT_EDITS[tbl] = nil;   -- a number not stored yet never lands in the replaced settings
+    end                         -- (a field still being typed in gets its text back from ImGui)
 end
 
 ----------------------------------------------------------------------------------------------------
 -- Settings tabs
 ----------------------------------------------------------------------------------------------------
+
+-- Choices for the settings window's combo boxes (made once: the window is drawn every frame).
+local OPT_STYLE = { { 'icons', 'Element icons in a row' }, { 'bars', 'One bar per maneuver' } };
+local OPT_ALIGN = { { 'left', 'Left' }, { 'center', 'Centered' } };
+local OPT_TIMER_MODE = { { 'auto', 'Auto (recommended)' }, { 'game', 'Always the game\'s buff timers' }, { 'flat', 'Always the duration above' } };
+local OPT_OV_SHOW = { { 'all', 'One bar per element' }, { 'top', 'Only the riskiest element' } };
+local OPT_OV_HIDE = { { 'chance', 'its overload chance reaches 0%' }, { 'burden', 'its burden has fully cooled' } };
+local OPT_OV_COLOR = { { 'risk', 'By risk of the next maneuver' }, { 'element', 'By element' } };
+local OPT_TIME = { { 'mss', '1:05 (minutes:seconds)' }, { 'sec', '65s (seconds)' } };
+local OPT_FILL = { { 'drain', 'Empty as time passes' }, { 'fill', 'Fill up until ready' } };
+local OPT_SORT = { { 'remaining', 'Soonest ready first' }, { 'name', 'By name' } };
+local OPT_GROW = { { 'down', 'Below (the window grows down)' }, { 'up', 'Above (the bottom edge stays put)' } };
+local CFG_SIZE, CFG_MIN, CFG_MAX = { 600, 580 }, { 460, 300 }, { FLT_MAX or 100000, FLT_MAX or 100000 };
+local LOCK_TIP = 'Locked, clicks go through the window. Unlock it (or /pupt unlock) to move or resize it.';
+local LOCK_TIP_HIDES = 'Locked, clicks go through the window and it only shows while something is running. Unlock it (or /pupt unlock) to move or resize it.';
+local COLOR_ENTRIES = {
+        { 'bar_bg', 'Bar background' }, { 'text', 'Text' }, { 'header', 'Automaton name' },
+        { 'ready', 'READY bars' }, { 'warn', 'Expiring maneuver text' }, { 'recast', 'Job ability bars' },
+        { 'maneuver_cd', 'Maneuver recast bar' }, { 'overload', 'OVERLOADED countdown' }, { 'empty', 'Empty maneuver slot' },
+        { 'overload_safe', 'Overload: no risk' }, { 'overload_low', 'Overload: low risk' },
+        { 'overload_mid', 'Overload: medium risk' }, { 'overload_high', 'Overload: high risk' },
+        { 'marker', 'Overload threshold line' }, { 'pet_hp', 'Automaton HP' }, { 'pet_mp', 'Automaton MP' },
+};
+local HELP_CMDS = {
+        { '/pupt', 'Open or close this window' },
+        { '/pupt show | hide | toggle', 'Show or hide the timer window' },
+        { '/pupt lock | unlock', 'Lock the timer window in place / allow moving and resizing' },
+        { '/pupt test', 'Show sample bars and fire test alerts' },
+        { '/pupt clear', 'Clear all running automaton timers' },
+        { '/pupt pet <name> | auto', 'Set the automaton name by hand, or go back to auto-detect' },
+        { '/pupt player <name> | auto', 'Set your name by hand, or go back to auto-detect' },
+        { '/pupt start <ability>', 'Start an ability timer by hand (e.g. /pupt start flashbulb)' },
+        { '/pupt profile [name]', 'List profiles, or load one (handy in a macro)' },
+        { '/pupt profile save <name>', 'Save the current settings as a profile' },
+        { '/pupt profile delete <name>', 'Delete a profile' },
+        { '/pupt copyfrom <character>', 'Copy another character\'s PupTimers settings' },
+        { '/pupt resetpos', 'Move the timer window back on screen' },
+        { '/pupt status', 'Version, what PupTimers detects, the automaton setup, the last error' },
+        { '/pupt debug', 'Toggle debug messages' },
+        { '/pupt defaults', 'Every setting back to its default' },
+};
+
+-- A name override: a text field and an Auto button that clears it (key: 'player' or 'pet').
+local NAME_IDS = { player = { '##pt_player', 'Auto##player' }, pet = { '##pt_pet', 'Auto##pet' } };
+local function name_row(label, key)
+    local cfg, ids = pt.settings, NAME_IDS[key];
+    Text(label);
+    imgui.SameLine(130);
+    push_width(170);
+    if (imgui.InputText(ids[1], ui.buf[key], 32)) then
+        cfg.names[key] = trim(ui.buf[key][1]);
+        pt.names_changed();
+        changed();
+    end
+    pop_width();
+    imgui.SameLine();
+    if (imgui.SmallButton(ids[2])) then
+        cfg.names[key] = '';
+        ui.buf[key][1] = '';
+        pt.names_changed();
+        changed();
+    end
+end
 
 local function tab_general()
     local cfg = pt.settings;
@@ -1057,43 +1182,12 @@ local function tab_general()
 
     heading('Names');
     TextWrapped('Leave these blank and PupTimers reads your name and your automaton\'s name from the game. Fill them in only if detection picks the wrong name.');
-    Text('Player name');
-    imgui.SameLine(130);
-    push_width(170);
-    if (imgui.InputText('##pt_player', ui.buf.player, 32)) then
-        cfg.names.player = trim(ui.buf.player[1]);
-        pt.names_changed();
-        changed();
-    end
-    pop_width();
-    imgui.SameLine();
-    if (imgui.SmallButton('Auto##player')) then
-        cfg.names.player = '';
-        ui.buf.player[1] = '';
-        pt.names_changed();
-        changed();
-    end
-
-    Text('Automaton name');
-    imgui.SameLine(130);
-    push_width(170);
-    if (imgui.InputText('##pt_pet', ui.buf.pet, 32)) then
-        cfg.names.pet = trim(ui.buf.pet[1]);
-        pt.names_changed();
-        changed();
-    end
-    pop_width();
-    imgui.SameLine();
-    if (imgui.SmallButton('Auto##pet')) then
-        cfg.names.pet = '';
-        ui.buf.pet[1] = '';
-        pt.names_changed();
-        changed();
-    end
+    name_row('Player name', 'player');
+    name_row('Automaton name', 'pet');
 
     heading('Timer window');
     checkbox('Show timer window', cfg.hud, 'visible');
-    if (checkbox('Lock position and size (clicks pass through)', cfg.hud, 'locked')) then
+    if (checkbox('Lock position and size (clicks pass through)', cfg.hud, 'locked', cfg.hud.hide_when_empty and LOCK_TIP_HIDES or LOCK_TIP)) then
         ui.force_pos = true;
     end
     checkbox('Hide when nothing is running', cfg.hud, 'hide_when_empty');
@@ -1102,7 +1196,7 @@ local function tab_general()
 
     heading('Detection');
     TextWrapped('Works the same with one chat window or a split two-window log: PupTimers reads the game data behind the log, not the windows on screen.');
-    checkbox('Read action packets (recommended)', cfg.detect, 'packets', 'Sees your automaton\'s abilities and your maneuvers directly from the game\'s combat data. Works even if your chat filters hide those messages.');
+    checkbox('Read the game\'s combat data (recommended)', cfg.detect, 'packets', 'Sees your automaton\'s abilities and your maneuvers directly from the game\'s combat data. Works even if your chat filters hide those messages.');
     checkbox('Read the chat log', cfg.detect, 'chat', 'Watches for "<Automaton> uses <Ability>" lines, whichever log window shows them. Needed for abilities you add yourself, and a backup for the others until the packets report them.');
     checkbox('Clear automaton timers when it leaves or a new one is called', cfg.behavior, 'reset_on_despawn', 'The server builds a new automaton each time you use Activate or Deus Ex Automata and when it follows you into a new zone. (Newer server code puts its abilities on cooldown then: tick "On act." for them on the Automaton tab.)');
     checkbox('Debug messages in chat', cfg.behavior, 'debug', 'Prints what PupTimers detects. Useful for checking that names are detected correctly.');
@@ -1122,16 +1216,9 @@ local function tab_general()
         set_status('Timer window moved to the top-left area.');
     end
     imgui.SameLine();
-    local now = os.clock();
-    local armed = (ui.reset_armed_until ~= nil and now < ui.reset_armed_until);
-    if (imgui.Button(armed and 'Click again to reset everything##rst' or 'Reset all settings##rst')) then
-        if (armed) then
-            ui.reset_armed_until = nil;
-            pt.actions.reset_all();
-            set_status('All settings are back to their defaults.');
-        else
-            ui.reset_armed_until = now + 4;
-        end
+    if (confirm_button('rst', 'Reset all settings', 'Click again to reset everything')) then
+        pt.actions.reset_all();
+        set_status('All settings are back to their defaults. The timer window is unlocked: place it, then /pupt lock.');
     end
     if (imgui.IsItemHovered()) then
         SetTooltip('Every PupTimers setting back to its default, for this character. Click twice to confirm. Same as /pupt defaults.');
@@ -1194,7 +1281,7 @@ local function tab_automaton()
     TextColored(DIM, 'On');
     imgui.SameLine(C_NAME);  TextColored(DIM, 'Ability');
     imgui.SameLine(C_CD);    TextColored(DIM, 'Cooldown (s)');
-    imgui.SameLine(C_COLOR); TextColored(DIM, 'Color');
+    imgui.SameLine(C_COLOR); TextColored(DIM, 'Colour');
     imgui.SameLine(C_ALERT); TextColored(DIM, 'Alert');
     imgui.SameLine(C_SPAWN); TextColored(DIM, 'On act.');
     if (imgui.IsItemHovered()) then
@@ -1228,6 +1315,9 @@ local function tab_automaton()
 
     heading('Add your own ability');
     TextWrapped('Type the ability name exactly as the chat log shows it after "<Automaton> uses". Custom abilities are detected from the chat log.');
+    if (not cfg.detect.chat) then
+        TextColored(WARN, 'Reading the chat log is off (General tab), so abilities added here are never detected.');
+    end
     push_width(170);
     imgui.InputText('Name##pt_newab', ui.new_ability.name, 32);
     pop_width();
@@ -1265,9 +1355,9 @@ local function tab_automaton()
 
     imgui.Spacing();
     imgui.Separator();
-    if (imgui.Button('Restore default cooldowns and colors')) then
+    if (confirm_button('rdc', 'Restore default cooldowns and colours', 'Click again to restore the defaults')) then
         pt.actions.restore_ability_defaults();
-        set_status('Default cooldowns and colors restored.');
+        set_status('Default cooldowns and colours restored.');
     end
 
     heading('Automaton HP and MP');
@@ -1288,14 +1378,16 @@ local function tab_maneuvers()
     TextWrapped('Maneuvers are read from your buff bar, so the list is always correct. Up to 3 can be active; using a 4th replaces the oldest one (shown first).');
     heading('Maneuvers');
     checkbox('Show maneuvers', m, 'enabled');
-    combo('Display', m, 'style', { { 'icons', 'Element icons in a row' }, { 'bars', 'One bar per maneuver' } }, 220);
+    combo('Display', m, 'style', OPT_STYLE, 220);
     if (m.style ~= 'bars') then
         slider_int('Icon size', m, 'icon_size', 16, 64);
         checkbox('Element symbols on icons (off = letters)', m, 'icon_glyphs');
-        combo('Icon alignment', m, 'icon_align', { { 'left', 'Left' }, { 'center', 'Centered' } }, 220);
+        combo('Icon alignment', m, 'icon_align', OPT_ALIGN, 220);
     end
-    slider_int('Maneuver duration (seconds)', m, 'duration', 10, 300, '%d', 'Maneuvers last a flat 60 seconds on HorizonXI. Time left = when you used it + this.');
-    combo('Maneuver timers', m, 'timer_mode', { { 'auto', 'Auto (recommended)' }, { 'game', 'Always the game\'s buff timers' }, { 'flat', 'Always the duration above' } }, 260);
+    -- A typed value, not a slider: one stray click on a slider would set a wrong duration.
+    input_int('Maneuver duration (seconds)', m, 'duration', 10, 300, 120);
+    help_marker('Maneuvers last a flat 60 seconds on HorizonXI. Time left = when you used it + this.');
+    combo('Maneuver timers', m, 'timer_mode', OPT_TIMER_MODE, 260);
     if (imgui.IsItemHovered()) then
         SetTooltip('Auto counts each maneuver from when you used it, which is exact. If one ever lasts longer than the duration above (some servers lengthen maneuvers in long fights), it switches to the game\'s own buff timers. Maneuvers that were already up when PupTimers loaded always use the game\'s timers.');
     end
@@ -1305,7 +1397,7 @@ local function tab_maneuvers()
     checkbox('Show empty slots while the automaton is out', m, 'show_empty');
     checkbox('Show the shared maneuver recast', m, 'show_recast');
     checkbox('Show an OVERLOADED warning', m, 'show_overload');
-    slider_int('Warn when below (seconds, 0 = off)', m, 'warn_at', 0, 30, '%d', 'The time turns orange and the bar pulses when a maneuver is about to wear off.');
+    slider_int('Warn when a maneuver has less than (seconds, 0 = off)', m, 'warn_at', 0, 30, '%d', 'The time turns orange and the bar pulses when a maneuver is about to wear off.');
     checkbox('Alert when a maneuver wears off', m, 'alert_wear', 'Uses the chat/sound options from the Alerts tab. Maneuvers replaced by a new maneuver are not announced.');
 
     heading('Your automaton\'s attachments');
@@ -1314,7 +1406,7 @@ local function tab_maneuvers()
     checkbox('Alert when losing a maneuver leaves an ability unpowered', m, 'alert_unpowered', 'Uses the chat/sound options from the Alerts tab.');
     checkbox('Say in chat when an attachment uses up maneuvers', m, 'explain_used', 'The game shows nothing when, for example, Economizer uses up your Dark Maneuvers.');
 
-    heading('Element colors');
+    heading('Element colours');
     for i, e in ipairs(data.elements) do
         push_id('mc_' .. e.key);
         color_edit(e.name, m.colors, e.key, false);
@@ -1328,7 +1420,6 @@ end
 local function tab_overload()
     local cfg = pt.settings;
     local o = cfg.overload;
-    local ovm = require('pt_overload');
 
     TextWrapped('After each maneuver the game reports your automaton\'s overload chance for that element. PupTimers pins the burden from that number, lets it cool down at the server\'s rate, and shows how risky the NEXT maneuver of that element would be. With bars that stay until the burden has fully cooled, a white line marks the overload threshold.');
     heading('Overload bar');
@@ -1337,12 +1428,12 @@ local function tab_overload()
         TextWrapped('The estimate is off: PupTimers tracks no burden and gives no overload risk warnings. The OVERLOADED countdown still works, because it comes from your buff timers.');
         return;
     end
-    combo('Bars', o, 'show', { { 'all', 'One bar per element' }, { 'top', 'Only the riskiest element' } }, 240);
-    combo('A bar goes away when', o, 'hide_at', { { 'chance', 'its overload chance reaches 0%' }, { 'burden', 'its burden has fully cooled' } }, 240);
+    combo('Bars', o, 'show', OPT_OV_SHOW, 240);
+    combo('A bar goes away when', o, 'hide_at', OPT_OV_HIDE, 240);
     if (o.hide_at ~= 'burden') then
         slider_int('Bar is full at (percent)', o, 'full_at', 10, 100);
     end
-    combo('Bar colour', o, 'color_by', { { 'risk', 'By risk of the next maneuver' }, { 'element', 'By element' } }, 240);
+    combo('Bar colour', o, 'color_by', OPT_OV_COLOR, 240);
     checkbox('Thin bars', o, 'compact');
     slider_int('Warn me at (% next-maneuver chance, 0 = off)', o, 'alert_risk', 0, 60, '%d', 'Chat/sound alert after a maneuver if another one of the same element would have at least this chance to overload.');
 
@@ -1418,9 +1509,6 @@ local function tab_overload()
         end
         TextColored(GOOD, 'Counting: ' .. table.concat(names, ', '));
     end
-    input_int('Extra threshold##ovth', o, 'extra_threshold', -50, 50, 120);
-    imgui.SameLine();
-    input_int('Extra decay##ovdc', o, 'extra_decay', -5, 10, 120);
 
     local p = ovm.after_overdrive(pt.overload_params());
     TextDisabled(('Now using: threshold %d, burden -%s every %ss, chance = burden - %d + %d%s'):format(
@@ -1449,14 +1537,14 @@ local function tab_overload()
             local risk = ovm.next_risk(pt.ov, e, now, p);
             Text(('%-8s burden %5.1f   chance now %3d   next %3d   per maneuver %s%s'):format(
                 data.elements[e].name, bur, math.floor(ovm.chance_of(bur, p) + 0.5), math.floor(risk + 0.5),
-                s.pred and ('%d (stats)'):format(s.pred) or (s.b and ('%.0f'):format(s.b)) or ('~' .. ((e == 8) and p.dark_burden or p.default_burden)),
+                s.pred and ('%d (stats)'):format(s.pred) or (s.b and ('%.0f'):format(s.b)) or ('~' .. ovm.base_burden(e, p)),
                 s.exact and '' or '  (estimate)'));
         end
     end
     if (not any) then
         TextDisabled('Use a maneuver to start tracking.');
     end
-    if (imgui.SmallButton('Reset estimate')) then
+    if (confirm_button('rse', 'Reset estimate', 'Click again to reset', true)) then
         pt.ov = ovm.new();
         pt.ov_last = nil;
     end
@@ -1476,9 +1564,14 @@ local function tab_overload()
         input_int('Default burden per maneuver', o, 'default_burden', 1, 40, 120);
         input_int('Dark Maneuver burden', o, 'dark_burden', 1, 40, 120);
         input_int('Burden added on activation', o, 'spawn_burden', 0, 100, 120);
-        if (imgui.Button('Restore overload defaults')) then
+        TextDisabled('For gear PupTimers does not know: added to the threshold / to the burden lost per tick.');
+        input_int('Extra threshold##ovth', o, 'extra_threshold', -50, 50, 120);
+        imgui.SameLine();
+        input_int('Extra decay##ovdc', o, 'extra_decay', -5, 10, 120);
+        if (confirm_button('rod', 'Restore overload defaults', 'Click again to restore the defaults')) then
             local d = data.default_settings().overload;
-            for _, k in ipairs({ 'tick', 'base_threshold', 'chance_offset', 'base_decay', 'default_burden', 'dark_burden', 'spawn_burden' }) do
+            for _, k in ipairs({ 'tick', 'base_threshold', 'chance_offset', 'base_decay', 'default_burden', 'dark_burden', 'spawn_burden',
+                                 'extra_threshold', 'extra_decay', 'heatsink_decay', 'heatsink_by_water' }) do
                 o[k] = d[k];
             end
             changed();
@@ -1515,22 +1608,6 @@ local function tab_recasts()
     TextDisabled('The maneuver recast is configured on the Maneuvers tab.');
 end
 
-local function parse_order(s)
-    local order, seen = {}, {};
-    for key in tostring(s or ''):gmatch('[%a_]+') do
-        if (SECTION_NAMES[key] ~= nil and not seen[key]) then
-            seen[key] = true;
-            order[#order + 1] = key;
-        end
-    end
-    for _, key in ipairs({ 'automaton', 'maneuvers', 'abilities', 'recasts' }) do
-        if (not seen[key]) then
-            order[#order + 1] = key;
-        end
-    end
-    return order;
-end
-
 local function tab_appearance()
     local cfg = pt.settings;
     local hud = cfg.hud;
@@ -1556,11 +1633,11 @@ local function tab_appearance()
     end
 
     heading('Layout');
-    combo('Time format', hud, 'time_format', { { 'mss', '1:05 (minutes:seconds)' }, { 'sec', '65s (seconds)' } }, 220);
-    combo('Cooldown bars', hud, 'fill_mode', { { 'drain', 'Empty as time passes' }, { 'fill', 'Fill up until ready' } }, 220);
-    combo('Sort abilities', hud, 'sort_abilities', { { 'remaining', 'Soonest ready first' }, { 'name', 'By name' } }, 220);
+    combo('Time format', hud, 'time_format', OPT_TIME, 220);
+    combo('Cooldown bars', hud, 'fill_mode', OPT_FILL, 220);
+    combo('Sort abilities', hud, 'sort_abilities', OPT_SORT, 220);
     local grow_before = hud.grow;
-    combo('New bars appear', hud, 'grow', { { 'down', 'Below (the window grows down)' }, { 'up', 'Above (the bottom edge stays put)' } }, 260);
+    combo('New bars appear', hud, 'grow', OPT_GROW, 260);
     if (imgui.IsItemHovered()) then
         SetTooltip('Above: park the window just above your chat log, and new bars push its top edge up instead of spilling over the log or off the screen.');
     end
@@ -1579,7 +1656,7 @@ local function tab_appearance()
     checkbox('Text shadow', hud, 'text_shadow');
 
     Text('Section order:');
-    local order = parse_order(hud.order);
+    local order = core.section_order(hud.order);
     for i, key in ipairs(order) do
         push_id('ord_' .. i);
         Text(('  %d. %s'):format(i, SECTION_NAMES[key]));
@@ -1599,8 +1676,8 @@ local function tab_appearance()
         pop_id();
     end
 
-    heading('Colors');
-    if (imgui.Button('Default colours')) then
+    heading('Colours');
+    if (confirm_button('pal_def', 'Default colours', 'Click again: default colours')) then
         pt.actions.apply_palette('default');
         set_status('Default colours restored.');
     end
@@ -1608,7 +1685,7 @@ local function tab_appearance()
         SetTooltip('Every colour back to its default: the window, the elements and the automaton abilities.');
     end
     imgui.SameLine();
-    if (imgui.Button('Colour-blind friendly')) then
+    if (confirm_button('pal_cb', 'Colour-blind friendly', 'Click again: colour-blind')) then
         pt.actions.apply_palette('colorblind');
         set_status('Colour-blind friendly colours applied.');
     end
@@ -1616,7 +1693,7 @@ local function tab_appearance()
         SetTooltip('Colours that stay distinct with the common kinds of colour blindness (the Okabe-Ito set). Overload risk runs blue, yellow, orange, vermillion instead of green to red.');
     end
     imgui.SameLine();
-    if (imgui.Button('High contrast')) then
+    if (confirm_button('pal_hc', 'High contrast', 'Click again: high contrast')) then
         pt.actions.apply_palette('contrast');
         set_status('High contrast colours applied.');
     end
@@ -1624,15 +1701,7 @@ local function tab_appearance()
         SetTooltip('Brighter colours on darker, more solid bars.');
     end
     local c = cfg.colors;
-    local entries = {
-        { 'bar_bg', 'Bar background' }, { 'text', 'Text' }, { 'header', 'Automaton name' },
-        { 'ready', 'READY bars' }, { 'warn', 'Expiring maneuver text' }, { 'recast', 'Job ability bars' },
-        { 'maneuver_cd', 'Maneuver recast bar' }, { 'overload', 'OVERLOADED countdown' }, { 'empty', 'Empty maneuver slot' },
-        { 'overload_safe', 'Overload: no risk' }, { 'overload_low', 'Overload: low risk' },
-        { 'overload_mid', 'Overload: medium risk' }, { 'overload_high', 'Overload: high risk' },
-        { 'marker', 'Overload threshold line' }, { 'pet_hp', 'Automaton HP' }, { 'pet_mp', 'Automaton MP' },
-    };
-    for i, e in ipairs(entries) do
+    for i, e in ipairs(COLOR_ENTRIES) do
         push_id('col_' .. e[1]);
         color_edit(e[2], c, e[1], false);
         pop_id();
@@ -1641,14 +1710,14 @@ local function tab_appearance()
         end
     end
     imgui.NewLine();
-    TextDisabled('Automaton ability colors are on the Automaton tab, element colors on the Maneuvers tab.');
+    TextDisabled('Automaton ability colours are on the Automaton tab, element colours on the Maneuvers tab.');
 end
 
 local function tab_alerts()
     local cfg = pt.settings;
     local a = cfg.alerts;
 
-    TextWrapped('Alerts fire when an automaton ability (or a job ability with "Alert" ticked) comes off cooldown.');
+    TextWrapped('These apply to every PupTimers alert: abilities coming off cooldown and the warnings you turn on in other tabs (overload risk, no Automaton Oil, Repair reminder ...). To quiet one ability, untick its Alert box on the Automaton or Recasts tab instead.');
     heading('When something is ready');
     checkbox('Print a message in the chat log', a, 'chat');
     checkbox('Play a sound', a, 'sound');
@@ -1677,25 +1746,7 @@ end
 local function tab_help()
     TextColored(HEAD, 'Commands');
     imgui.Separator();
-    local cmds = {
-        { '/pupt', 'Open or close this window' },
-        { '/pupt show | hide | toggle', 'Show or hide the timer window' },
-        { '/pupt lock | unlock', 'Lock the timer window in place / allow moving and resizing' },
-        { '/pupt test', 'Show sample bars and fire test alerts' },
-        { '/pupt clear', 'Clear all running automaton timers' },
-        { '/pupt pet <name> | auto', 'Set the automaton name by hand, or go back to auto-detect' },
-        { '/pupt player <name> | auto', 'Set your name by hand, or go back to auto-detect' },
-        { '/pupt start <ability>', 'Start an ability timer by hand (e.g. /pupt start flashbulb)' },
-        { '/pupt profile [name]', 'List profiles, or load one (handy in a macro)' },
-        { '/pupt profile save <name>', 'Save the current settings as a profile' },
-        { '/pupt profile delete <name>', 'Delete a profile' },
-        { '/pupt copyfrom <character>', 'Copy another character\'s PupTimers settings' },
-        { '/pupt resetpos', 'Move the timer window back on screen' },
-        { '/pupt status', 'Version, what PupTimers detects, the automaton setup, the last error' },
-        { '/pupt debug', 'Toggle debug messages' },
-        { '/pupt defaults', 'Every setting back to its default' },
-    };
-    for _, c in ipairs(cmds) do
+    for _, c in ipairs(HELP_CMDS) do
         TextColored(GOOD, c[1]);
         imgui.SameLine(210);
         Text(c[2]);
@@ -1720,8 +1771,8 @@ function ui.render_config(now)
         return;
     end
 
-    imgui.SetNextWindowSize({ 600, 580 }, ImGuiCond_FirstUseEver);
-    imgui.SetNextWindowSizeConstraints({ 460, 300 }, { FLT_MAX or 100000, FLT_MAX or 100000 });
+    imgui.SetNextWindowSize(CFG_SIZE, ImGuiCond_FirstUseEver);
+    imgui.SetNextWindowSizeConstraints(CFG_MIN, CFG_MAX);
     local ok, err = true, nil;
     if (imgui.Begin(('PupTimers v%s##pt_config'):format(addon.version), ui.config_open, ImGuiWindowFlags_NoCollapse)) then
         ok, err = pcall(ui.config_body, now);
@@ -1733,8 +1784,8 @@ function ui.render_config(now)
         ui.config_open[1] = false;
         error(err, 0);
     end
-    if (not ui.config_open[1]) then
-        pt.save_now();
+    if (not ui.config_open[1] and pt.dirty_at ~= nil) then
+        pt.save_now();   -- closed with a change not written yet: write it now
     end
 end
 
@@ -1778,7 +1829,6 @@ local function tab_profiles()
     if (#names == 0) then
         TextDisabled('No profiles yet.');
     end
-    local now = os.clock();
     for i, name in ipairs(names) do
         push_id('prof_' .. i);
         Text(name .. ((name == pc.last) and '   (loaded last)' or ''));
@@ -1788,15 +1838,9 @@ local function tab_profiles()
             set_status(text);
         end
         imgui.SameLine();
-        local armed = (ui.prof_del == name and now < (ui.prof_del_until or 0));
-        if (imgui.SmallButton(armed and 'Click again to delete' or 'Delete')) then
-            if (armed) then
-                local _, text = pt.actions.profile_delete(name);
-                ui.prof_del = nil;
-                set_status(text);
-            else
-                ui.prof_del, ui.prof_del_until = name, now + 4;
-            end
+        if (confirm_button('del_' .. name, 'Delete', 'Click again to delete', true)) then
+            local _, text = pt.actions.profile_delete(name);
+            set_status(text);
         end
         pop_id();
     end
@@ -1854,15 +1898,9 @@ local function tab_profiles()
         end
         pop_width();
         imgui.SameLine();
-        local armed = (ui.copy_armed_until ~= nil and os.clock() < ui.copy_armed_until);
-        if (imgui.Button(armed and 'Click again to copy##cpy' or 'Copy their settings##cpy')) then
-            if (armed) then
-                ui.copy_armed_until = nil;
-                local _, text = pt.actions.copy_from(others[pick].name);
-                set_status(text);
-            else
-                ui.copy_armed_until = os.clock() + 4;
-            end
+        if (confirm_button('cpy', 'Copy their settings', 'Click again to copy')) then
+            local _, text = pt.actions.copy_from(others[pick].name);
+            set_status(text);
         end
         if (imgui.IsItemHovered()) then
             SetTooltip('Replaces this character\'s PupTimers settings with theirs (look, alerts, abilities, maneuvers, overload). Window position and names stay. Click twice to confirm.');
@@ -1871,15 +1909,15 @@ local function tab_profiles()
 end
 
 local TABS = {
-    { 'General', function () tab_general(); end },
-    { 'Automaton', function () tab_automaton(); end },
-    { 'Maneuvers', function () tab_maneuvers(); end },
-    { 'Overload', function () tab_overload(); end },
-    { 'Recasts', function () tab_recasts(); end },
-    { 'Appearance', function () tab_appearance(); end },
-    { 'Alerts', function () tab_alerts(); end },
-    { 'Profiles', function () tab_profiles(); end },
-    { 'Help', function () tab_help(); end },
+    { 'General', tab_general },
+    { 'Automaton', tab_automaton },
+    { 'Maneuvers', tab_maneuvers },
+    { 'Overload', tab_overload },
+    { 'Recasts', tab_recasts },
+    { 'Appearance', tab_appearance },
+    { 'Alerts', tab_alerts },
+    { 'Profiles', tab_profiles },
+    { 'Help', tab_help },
 };
 
 function ui.config_body(now)
@@ -1935,6 +1973,7 @@ function ui.toggle_config(state)
 end
 
 function ui.render(now)
+    ui.frame = ui.frame + 1;
     -- The timer window and the settings window are independent: a failure in one must not hide the other.
     local ok1, err1 = pcall(ui.render_hud, now);
     local ok2, err2 = pcall(ui.render_config, now);

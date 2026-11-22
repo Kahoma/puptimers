@@ -456,13 +456,7 @@ function profiles.parse(text)
     return clean;
 end
 
---[[
-* Reads another character's settings.lua, as the Ashita settings library writes it, without running
-* anything from it. Every line must be one the library writes:
-*   require('common');  /  local settings = T{ };  /  return settings;
-*   settings[k1][k2]... = <string, number, true/false, 1/0, -1/0, 0/0 or T{ }>;
-* Returns the settings table, or nil and a reason.
---]]
+-- One key of a settings line: a quoted string, true / false, or a number.
 local function settings_key(line, i)
     local c = line:byte(i);
     if (STOP[c] ~= nil) then
@@ -522,6 +516,14 @@ local function settings_line(root, line)
     return true;
 end
 
+--[[
+* Reads another character's settings.lua, as the Ashita settings library writes it, without running
+* anything from it. Every line must be one the library writes:
+*   require('common');  /  local settings = T{ };  /  return settings;
+*   settings[k1][k2]... = <string, number, true/false, 1/0, -1/0, 0/0 or T{ }>;
+* and the file must end with 'return settings;' (one caught while it is being written is refused).
+* Returns the settings table, or nil and a reason.
+--]]
 function profiles.read_settings_text(text)
     if (type(text) ~= 'string' or text == '' or #text > profiles.MAX_SETTINGS) then
         return nil, 'empty or too large';

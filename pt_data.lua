@@ -103,8 +103,8 @@ data.attachments = {
 };
 -- The attachments PupTimers acts on.
 data.ATT = {
-    flame_holder = 7, tactical_processor = 37, ice_maker = 39, replicator = 71, schurzen = 102,
-    heatsink = 162, condenser = 166, damage_gauge = 195, optic_fiber = 198, economizer = 230,
+    flame_holder = 7, ice_maker = 39, replicator = 71, schurzen = 102,
+    heatsink = 162, condenser = 166, damage_gauge = 195, economizer = 230,
     mana_converter = 226,
 };
 
@@ -117,6 +117,7 @@ data.heads = {
 data.oils = { [18731] = 'Oil', [18732] = 'Oil+1', [18733] = 'Oil+2', [19185] = 'Oil+3' };
 
 data.SHIELD_BASH_COLOR = { 0.62, 0.68, 0.76, 1.0 };
+data.CUSTOM_COLOR = { 0.85, 0.65, 0.20, 1.0 };   -- abilities added by hand start with this colour
 
 -- Automaton frames (for switching settings profiles with the frame).
 data.frames = {
@@ -142,12 +143,10 @@ data.short_names = {
 
 -- Automaton actions that have no cooldown of their own (TP weapon skills, ranged attacks).
 -- They are never offered as "seen but not tracked" in the settings window.
-data.ignored_pet_skills = {
-    ['chimera ripper'] = true, ['string clipper'] = true, ['arcuballista'] = true, ['slapstick'] = true,
-    ['cannibal blade'] = true, ['daze'] = true, ['knockout'] = true, ['bone crusher'] = true,
-    ['armor piercer'] = true, ['magic mortar'] = true, ['string shredder'] = true, ['armor shatterer'] = true,
-    ['ranged attack'] = true,
-};
+data.ignored_pet_skills = { ['ranged attack'] = true };
+for _, name in pairs(data.automaton_ws) do
+    data.ignored_pet_skills[name:lower()] = true;
+end
 
 -- Gear and attachments that change burden / overload (LandSandBoat item data, level 75 and below).
 --   thresh   : OVERLOAD_THRESH   (more burden needed before an overload can happen)
@@ -326,7 +325,7 @@ function data.default_settings()
                                          -- (used once the game's own reports show it is right)
             heatsink_decay     = 1,      -- Heatsink: extra cooling per tick (current server code for this era: +1)
             heatsink_by_water  = false,  -- older server rule: +2/+4/+5/+6 with 0/1/2/3 Water Maneuvers instead
-            attachments_auto   = true,   -- take Heatsink / Tactical Processor from the game's setup data
+            attachments_auto   = true,   -- take Heatsink from the game's setup data
             -- Gear and attachments (one entry per item, filled below from data.overload_gear)
             gear               = {},     -- key -> { count = bool, worn_only = bool }
             heatsink           = false,  -- Heatsink attachment equipped (by hand, if the setup is not read)

@@ -40,7 +40,9 @@ never performs an action for you. See [What PupTimers reads](#what-puptimers-rea
 
 ## First-time setup (30 seconds)
 
-1. The first time you are on Puppetmaster, the window is **unlocked** and shows sample bars.
+1. The first time you are on Puppetmaster, the window is **unlocked** and shows sample bars
+   (headed "Sample bars (/pupt lock)"). On another job, `/pupt unlock` opens the settings window,
+   and the timer window shows while it is open.
 2. Drag it where you want it. Drag its **lower-right corner** to change the width (the height
    follows the bars).
 3. Type `/pupt lock`. Locked, it is click-through and only appears when something is running.
@@ -56,11 +58,11 @@ never performs an action for you. See [What PupTimers reads](#what-puptimers-rea
 | `/pupt lock` / `/pupt unlock` | Lock in place (click-through) / allow moving and resizing |
 | `/pupt test` | Sample bars + three test alerts (4, 8 and 12 seconds); real cooldowns are left alone |
 | `/pupt clear` | Clear running automaton timers |
-| `/pupt pet <name>` / `/pupt pet auto` | Set the automaton name by hand / back to auto-detect |
-| `/pupt player <name>` / `/pupt player auto` | Set your name by hand / back to auto-detect |
+| `/pupt pet <name>` / `/pupt pet auto` | Set the automaton name by hand / back to auto-detect (`/pupt pet` alone shows it) |
+| `/pupt player <name>` / `/pupt player auto` | Set your name by hand / back to auto-detect (`/pupt player` alone shows it) |
 | `/pupt start <ability>` | Start a timer by hand, e.g. `/pupt start economizer` |
 | `/pupt profile` | List your profiles |
-| `/pupt profile <name>` | Load a profile (handy in a macro) |
+| `/pupt profile <name>` | Load a profile (handy in a macro; capitals do not matter) |
 | `/pupt profile save <name>` / `delete <name>` | Save the current settings as a profile / delete one |
 | `/pupt copyfrom <character>` | Copy another character's PupTimers settings |
 | `/pupt resetpos` | Move the timer window back on screen |
@@ -102,7 +104,7 @@ split two-window log (PC) behave exactly the same:
 
 Each active maneuver is a coloured tile with its element symbol (or letters, if you prefer). The
 tile drains from the top as the maneuver runs out, the time left is printed under it, and the
-oldest maneuver is always on the left. Under the row, one **Maneuver** bar shows the shared
+oldest maneuver is always on the left. Under the row, one **Next maneuver** bar shows the shared
 maneuver recast. Icon size, symbols/letters and alignment are on the **Maneuvers** tab, where you
 can also switch back to one bar per maneuver.
 
@@ -186,16 +188,18 @@ clock, so between reports the estimate can be off by about one tick.
 Once the setup is read from the game:
 
 - **Unpowered abilities:** a dim line under the maneuver icons names equipped abilities that cannot
-  fire because their maneuver is not up, e.g. "Unpowered: Provoke (Fire)". An optional alert (off by
-  default) tells you when losing a maneuver leaves one unpowered. Both are on the Maneuvers tab.
+  fire because their maneuver is not up, e.g. "Unpowered: Provoke (Fire)" (in a narrow window:
+  "Needs Fire"). An optional alert (off by default) tells you when losing a maneuver leaves one
+  unpowered. Both are on the Maneuvers tab.
 - **READY bars** (if you keep them on screen) say what they need, e.g. "needs Fire".
 - **Maneuvers an attachment used up** are explained in chat, because the game shows nothing:
   Economizer (all Dark), Replicator (all Wind), Eraser (every maneuver on current server code, Light
   ones on older code), Flame Holder (Fire, for the automaton's weapon skill), Ice Maker (Ice, for its
   elemental spell), Condenser (a Water Maneuver instead of an overload), Schurzen (an Earth Maneuver
   to survive a fatal hit). Maneuvers that were already up when PupTimers loaded are left out until
-  the game has sent their timers, because PupTimers cannot tell whether they simply ran out. These
-  notes can be turned off on the Maneuvers tab.
+  the game has sent their timers, because PupTimers cannot tell whether they simply ran out. Flame
+  Holder and Ice Maker are explained once per session, since using up those maneuvers is what they
+  are for. These notes can be turned off on the Maneuvers tab.
 - The **Automaton** tab lists only the abilities your setup can use ("Show every ability" lists the
   rest).
 - **Profiles can follow the frame:** on the Profiles tab, tick "Load the profile chosen below when
@@ -250,7 +254,8 @@ ability on the Automaton tab.
 - **General** – detected job/names, name overrides, lock/hide options, detection sources, test
   tools, clearing the automaton bars when it leaves or a new one is called (the server builds a new
   automaton on Activate, Deus Ex Automata and when it follows you into a new zone), and "Reset all
-  settings".
+  settings". Buttons that cannot be undone (reset, restore defaults, colour schemes, deleting a
+  profile, copying settings) ask for a second click.
 - **Automaton** – turn each ability on/off, edit its cooldown and colour, alert on/off, a Test button
   (a sample bar; running cooldowns are not changed), add your own abilities, a list of abilities
   your automaton used that are not tracked yet ("Track it" fills in the name: enter the cooldown and
@@ -270,6 +275,9 @@ ability on the Automaton tab.
 - **Alerts** – chat message, sound (any `.wav` you drop in `sounds\`), optional READY bars.
 - **Profiles** – save, load and delete profiles, pick one per automaton frame, and copy another
   character's settings.
+
+A number you type (a cooldown, the maneuver duration, a size or position, an overload constant) is
+stored when you press Enter or Tab or click elsewhere; the +/- buttons store it when you let go.
 
 ## Profiles
 
@@ -302,11 +310,12 @@ PupTimers is built to stay out of the way in busy fights and crowded zones:
   slot every 2 seconds (the inventory is only counted again when the game says it changed).
 - On any other job PupTimers only checks your job, name and status (to notice when you are back on
   Puppetmaster); it tracks nothing and reads nothing else.
-- Settings are written to disk after a change (at most once a second), when you close the settings
-  window, and at login and unload.
-- Every event handler is guarded: a problem is reported in one plain line, at most once a minute,
-  and the game carries on. If reading action data or chat keeps failing, that part switches itself
-  off and the other keeps working.
+- Settings are written to disk only after a change (at most once a second, or at once when you close
+  the settings window with a change not yet written), when PupTimers is loaded or unloaded, and at
+  login and logout (Ashita's settings library does those two).
+- Every event handler (drawing, packets, chat and `/pupt` commands) is guarded: a problem is reported
+  in one plain line, at most once a minute, and the game carries on. If reading action data or chat
+  keeps failing, that part switches itself off and the other keeps working.
 
 ## What PupTimers reads, and what it never does
 
@@ -325,7 +334,7 @@ already receives; PupTimers only looks at it.
 | One read-only clock signature (the same one XIUI uses) | the server time for buff end times |
 | Its own settings file, through Ashita's settings library (which loads it as Lua, as for every addon that uses the library) | its settings |
 | `profiles.lua`, and another character's PupTimers settings when you copy them | profiles. Read as plain data by PupTimers' own parser: nothing in them is ever run |
-| The names of the folders in `config\addons\puptimers\`, and whether each has a `settings.lua` (only while the Profiles tab is open) | the "Copy from another character" list |
+| The names of the folders in `config\addons\puptimers\`, and whether each has a `settings.lua` (only while the Profiles tab is open, or when you use `/pupt copyfrom`) | the "Copy from another character" list |
 | Files written: its own settings (through Ashita's settings library), `profiles.lua` (written to a temporary file that then replaces it; the temporary file is deleted if that fails, and the folder is created if missing), a damaged `settings.lua` renamed to `settings.lua.bad` (replacing an older one) | saving settings and profiles |
 | Sounds: `.wav` files in its own `sounds` folder, off by default | optional alerts |
 
@@ -351,6 +360,8 @@ marked **~** are PupTimers' estimate; recasts and buff times are the game's.
   renamed to `settings.lua.bad` and the defaults are used. Your other characters are not affected.
 - **"The profiles file could not be read":** PupTimers leaves a damaged `profiles.lua` alone and
   saves nothing over it. Delete or fix the file to start again.
+- **"Stopped reading action data (or chat lines) after repeated problems":** everything else keeps
+  working; `/addon reload puptimers` tries again, and `/pupt status` shows the last error.
 
 ## Files
 

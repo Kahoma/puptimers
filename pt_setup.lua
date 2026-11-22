@@ -31,15 +31,12 @@ end
 function setup.new()
     return {
         known      = false,  -- a PUP 0x044 was read
-        is_sub     = false,  -- it came as the support-job copy
         head       = 0,
         frame      = 0,
         slots      = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         hp = 0, max_hp = 0, mp = 0, max_mp = 0,
         stat_base  = { 0, 0, 0, 0, 0, 0, 0 },
         stat_bonus = { 0, 0, 0, 0, 0, 0, 0 },
-        sig        = '',     -- head/frame/attachments as text: changes only when the setup changes
-        at         = nil,    -- os.clock() of the last packet
     };
 end
 
@@ -47,14 +44,13 @@ end
 * Reads a 0x044 packet into st (no tables or strings are made unless the setup itself changed).
 * @return true if it carried PUP data, and whether head/frame/attachments changed.
 --]]
-function setup.parse(st, data, now)
+function setup.parse(st, data)
     if (type(data) ~= 'string' or #data < setup.MIN_SIZE) then
         return false, false;
     end
     if (data:byte(5) ~= setup.PUP_JOB) then
         return false, false;
     end
-    st.is_sub = (data:byte(6) == 1);
     local changed = (not st.known);
     local head, frame = data:byte(9, 10);
     if (head ~= st.head or frame ~= st.frame) then
@@ -77,14 +73,6 @@ function setup.parse(st, data, now)
         bonus[i + 1] = s16(data, 131 + 4 * i);
     end
     st.known = true;
-    st.at = now;
-    if (changed) then
-        local parts = { head, frame };
-        for i = 1, 12 do
-            parts[#parts + 1] = slots[i];
-        end
-        st.sig = table.concat(parts, ',');
-    end
     return true, changed;
 end
 

@@ -175,8 +175,10 @@ end
 *
 * @return nil, or one of:
 *   { kind = 'pet_ability', key = <ability key> }
-*   { kind = 'pet_unknown', text = <clean line> }      -- pet used something not in the list
-*   { kind = 'maneuver',    element = <1..8> }         -- player used a maneuver
+*   { kind = 'pet_unknown', name = <ability name> }     -- pet used something not in the list
+*   { kind = 'maneuver', element = <1..8>, overload_chance = <n>?, overloaded = <bool>? }
+*   { kind = 'overload_report', element = <1..8>?, chance = <n>, overloaded = <bool> }
+*   { kind = 'overloaded' }                              -- "<you> is overloaded!" on its own line
 --]]
 function core.parse_chat(line, ctx)
     if (ctx == nil) then
@@ -204,7 +206,7 @@ function core.parse_chat(line, ctx)
         if (#name > 32) then
             name = name:sub(1, 32);
         end
-        return { kind = 'pet_unknown', text = text, name = name };
+        return { kind = 'pet_unknown', name = name };
     end
 
     -- Client text of message 798 / 799 (from the game's own message data):
@@ -778,6 +780,62 @@ local function replaced_loaded_index(list, el)
     return best;
 end
 
+-- When a tracked maneuver ends: the game's end time when known, else start + duration (nil for one
+-- that was already up at load and has no end time from the game yet).
+function core.maneuver_end(e, duration)
+    return e.ends or ((not e.unknown) and (e.start + duration) or nil);
+end
+
+--[[
+* Which tracked maneuver of element el went, when the buff bar shows one fewer (see maneuver_sync):
+* normally the oldest of that element; the newest when the oldest is not due yet and no new
+* maneuver pushed it out (Condenser and Schurzen take the newest); and when the game's timers
+* (game_ends) already show the new state, the one whose end matches none of them.
+* @return its index in list
+--]]
+local function gone_index(list, el, count, now, duration, pushing, oldest, game_ends)
+    local first, last = nil, nil;
+    for i, e in ipairs(list) do
+        if (e.el == el) then
+            first = first or i;
+            last = i;
+        end
+    end
+    if (last == first) then
+        return first;
+    end
+    local idx = first;
+    local fe = list[first];
+    local fends = core.maneuver_end(fe, duration);
+    if (fends ~= nil and now < fends - 3 and not (pushing and fe == oldest)) then
+        idx = last;
+    end
+    local gl = game_ends and game_ends[el];
+    if (gl == nil or #gl == 0 or #gl ~= count) then
+        return idx;
+    end
+    local worst, worst_d = nil, -1;
+    for i, e in ipairs(list) do
+        if (e.el == el) then
+            local exp = core.maneuver_end(e, duration);
+            if (exp == nil) then
+                return idx;   -- one without a known end: the timers cannot settle it
+            end
+            local d = math.huge;
+            for _, g in ipairs(gl) do
+                d = math.min(d, math.abs(g - exp));
+            end
+            if (d > worst_d) then
+                worst, worst_d = i, d;
+            end
+        end
+    end
+    if (worst_d > 5) then
+        idx = worst;
+    end
+    return idx;
+end
+
 --[[
 * Reconciles tracked maneuvers with the real buff counts.
 *
@@ -818,46 +876,7 @@ function core.maneuver_sync(state, counts, now, max_count, duration, game_ends)
     for el = 1, 8 do
         local extra = (tracked[el] or 0) - (counts[el] or 0);
         while (extra > 0) do
-            local first, last = nil, nil;
-            for i, e in ipairs(m.list) do
-                if (e.el == el) then
-                    first = first or i;
-                    last = i;
-                end
-            end
-            local idx = first;
-            if (last ~= first) then
-                local fe = m.list[first];
-                local fends = fe.ends or ((not fe.unknown) and (fe.start + duration) or nil);
-                if (fends ~= nil and now < fends - 3 and not (pushing and fe == oldest)) then
-                    idx = last;
-                end
-                local gl = game_ends and game_ends[el];
-                if (gl ~= nil and #gl > 0 and #gl == (counts[el] or 0)) then
-                    -- The one whose end matches none of the game's timers is the one that went.
-                    local worst, worst_d = nil, -1;
-                    for i, e in ipairs(m.list) do
-                        if (e.el == el) then
-                            local exp = e.ends or ((not e.unknown) and (e.start + duration) or nil);
-                            if (exp == nil) then
-                                worst = nil;
-                                break;
-                            end
-                            local d = math.huge;
-                            for _, g in ipairs(gl) do
-                                d = math.min(d, math.abs(g - exp));
-                            end
-                            if (d > worst_d) then
-                                worst, worst_d = i, d;
-                            end
-                        end
-                    end
-                    if (worst ~= nil and worst_d > 5) then
-                        idx = worst;
-                    end
-                end
-            end
-            local e = table.remove(m.list, idx);
+            local e = table.remove(m.list, gone_index(m.list, el, counts[el] or 0, now, duration, pushing, oldest, game_ends));
             removed = removed or {};
             removed[#removed + 1] = { el = el, replaced = false, unknown = e.unknown, start = e.start, ends = e.ends, oldest = (e == oldest) };
             extra = extra - 1;
@@ -931,7 +950,7 @@ function core.maneuver_sync(state, counts, now, max_count, duration, game_ends)
             local idx, soonest = nil, nil;
             for i, e in ipairs(m.list) do
                 if (e.el == p.el) then
-                    local ends = e.ends or ((not e.unknown) and (e.start + duration) or nil);
+                    local ends = core.maneuver_end(e, duration);
                     if (ends ~= nil and ends <= now + 0.5 and (soonest == nil or ends < soonest)) then
                         idx, soonest = i, ends;
                     end
@@ -979,7 +998,8 @@ end
 * Works whether the array is 0- or 1-based.
 *
 * @param out - optional table to fill (reused by the caller to avoid garbage)
-* @return counts, overloaded, overdrive
+* @return counts, overloaded, overdrive, a fingerprint of your other buffs (they can change your
+*         stats: the burden-from-stats check compares it)
 --]]
 function core.count_maneuvers(buffs, out)
     local counts = out or {};
@@ -987,9 +1007,9 @@ function core.count_maneuvers(buffs, out)
         counts[el] = 0;
     end
     local overload, overdrive = false, false;
-    local print = 0;   -- fingerprint of the other buffs (they can change your stats)
+    local buff_print = 0;   -- fingerprint of the other buffs (they can change your stats)
     if (buffs == nil) then
-        return counts, overload, overdrive, print;
+        return counts, overload, overdrive, buff_print;
     end
     for i = 0, 32 do
         local id = buffs[i];
@@ -1004,12 +1024,12 @@ function core.count_maneuvers(buffs, out)
                     overdrive = true;
                 end
                 if (id > 0 and id < 255) then
-                    print = print + id * id + 1;
+                    buff_print = buff_print + id * id + 1;
                 end
             end
         end
     end
-    return counts, overload, overdrive, print;
+    return counts, overload, overdrive, buff_print;
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -1058,9 +1078,11 @@ function core.update_job_abilities(state, defs, recasts, now, main_is_pup)
         else
             if (s.active) then
                 s.active = false;
-                -- Only a timer that ran down counts as "ready"; a sudden drop (zone, job change,
-                -- recast reset) is not announced.
-                if (s.remaining <= 3.0) then
+                -- A timer that ran down counts as "ready": its last reading was near 0, or its end
+                -- has passed (it ended during a loading screen or a stall, when nothing was read).
+                -- A drop well before its end (Deactivate resetting Activate, a job change) is not
+                -- announced.
+                if (s.remaining <= 3.0 or (s.ends ~= nil and now >= s.ends - 1.0)) then
                     s.ready_since = now;
                     fired = fired or {};
                     fired[#fired + 1] = def;
@@ -1131,6 +1153,7 @@ local function fill_frac(remaining, total, mode)
     end
     return f;
 end
+core.fill_frac = fill_frac;   -- the timer window moves bars with it between rebuilds
 
 --[[
 * Returns the display definition (name, color, enabled...) for an ability key, merging the static
@@ -1184,8 +1207,6 @@ function core.all_abilities(cfg)
     return list;
 end
 
--- Name, colour and on/off for a running timer, without building a table (the view is rebuilt
--- 10 times a second).
 --[[
 * A shorter name for narrow windows: a known abbreviation, the name itself if it is short, or the
 * first word with the start of the second ('Arc Generator' -> 'Arc Gene.'). Cached by name.
@@ -1224,6 +1245,8 @@ for _, e in ipairs(data.elements) do
     NEEDS[e.key] = 'needs ' .. e.name;
 end
 
+-- Name, colour and on/off for a running timer, without building a table (the view is rebuilt
+-- 10 times a second).
 local function timer_display(cfg, key, t, colors)
     local a = core.ability_def[key];
     local s = cfg.abilities[key];
@@ -1249,25 +1272,31 @@ local function by_sortv(a, b)
     return a.label < b.label;
 end
 
-local SECTION_KEYS = { 'automaton', 'maneuvers', 'abilities', 'recasts' };
+core.SECTION_KEYS = { 'automaton', 'maneuvers', 'abilities', 'recasts' };
+local SECTION_KNOWN = { automaton = true, maneuvers = true, abilities = true, recasts = true };
 local order_text, order_list = nil, nil;   -- cfg.hud.order parsed once per change
+
+-- The section keys in the order hud.order names them, each once, then any it leaves out (a new list).
+function core.section_order(text)
+    local list, seen = {}, {};
+    for key in tostring(text or ''):gmatch('[%a_]+') do
+        if (SECTION_KNOWN[key] and not seen[key]) then
+            seen[key] = true;
+            list[#list + 1] = key;
+        end
+    end
+    for _, key in ipairs(core.SECTION_KEYS) do
+        if (not seen[key]) then
+            list[#list + 1] = key;
+        end
+    end
+    return list;
+end
 
 local function order_sections(view, cfg, by_key)
     local text = tostring(cfg.hud.order or '');
     if (text ~= order_text) then
-        local list, seen = {}, {};
-        for key in text:gmatch('[%a_]+') do
-            if (by_key[key] ~= nil and not seen[key]) then
-                seen[key] = true;
-                list[#list + 1] = key;
-            end
-        end
-        for _, key in ipairs(SECTION_KEYS) do
-            if (not seen[key]) then
-                list[#list + 1] = key;
-            end
-        end
-        order_text, order_list = text, list;
+        order_text, order_list = text, core.section_order(text);
     end
     for i = 1, #order_list do
         view.sections[i] = by_key[order_list[i]];
@@ -1277,8 +1306,12 @@ end
 --[[
 * Builds the rows the HUD should draw.
 *
-* @param env - { pet_present, pet_name, maneuver_recast, maneuver_recast_at, overload_rows, overload_left }
-* @return { header = string|nil, sections = { { key, rows = {...} }, ... }, count = number of rows }
+* @param env - what the game reading found: pet_present, pet_name, pet_hpp, pet_mpp, pet_hp_marks,
+*               pet_mp_marks, maneuver_recast, maneuver_recast_at, man_counts, overload_rows,
+*               overload_left, unpowered_text, unpowered_short, deactivate_hint, repair_label,
+*               repair_short
+* @return { header = string|nil, sections = { { key, rows = {...} }, ... }, count = number of rows,
+*          notes = number of note rows (they do not keep a "hide when empty" window up) }
 *
 * Row fields: label, right, frac (0..1), color, flash, warn, dim, thin.
 * Timed rows also carry dyn_end / dyn_total / dyn_mode so the window can move the bar smoothly every
@@ -1294,18 +1327,20 @@ function core.build_view(state, cfg, now, env)
     -- Maneuvers ---------------------------------------------------------------------------------
     local sec_man = { key = 'maneuvers', rows = {} };
     local man_rows = sec_man.rows;
+    local m = state.man;
+    -- The OVERLOADED countdown, the overload bars and the Unpowered line have their own options:
+    -- they do not depend on "Show maneuvers", which only covers the icons and the recast bar.
+    if (m.overload and cfg.maneuvers.show_overload) then
+        local left = env.overload_left;
+        man_rows[#man_rows + 1] = {
+            label = 'OVERLOADED',
+            right = (left ~= nil and left > 0) and core.format_time(left, fmt) or '',
+            frac  = 1,
+            color = colors.overload,
+            flash = true,
+        };
+    end
     if (cfg.maneuvers.enabled) then
-        local m = state.man;
-        if (m.overload and cfg.maneuvers.show_overload) then
-            local left = env.overload_left;
-            man_rows[#man_rows + 1] = {
-                label = 'OVERLOADED',
-                right = (left ~= nil and left > 0) and core.format_time(left, fmt) or '',
-                frac  = 1,
-                color = colors.overload,
-                flash = true,
-            };
-        end
         local duration = tonumber(cfg.maneuvers.duration) or 60;
         if (duration <= 0) then duration = 60; end
         local warn_at = tonumber(cfg.maneuvers.warn_at) or 0;
@@ -1363,28 +1398,29 @@ function core.build_view(state, cfg, now, env)
             local total = (state.ja_maneuver_total ~= nil and state.ja_maneuver_total > 0) and state.ja_maneuver_total or 10;
             if (mr > total) then total = mr; end
             man_rows[#man_rows + 1] = {
-                label     = as_icons and 'Maneuver' or 'Next maneuver',
-                right     = core.format_time(mr, fmt),
-                frac      = fill_frac(mr, total, mode),
-                dyn_end   = env.maneuver_recast_at or (now + mr),
-                dyn_total = total,
-                dyn_mode  = mode,
-                color     = colors.maneuver_cd,
-                thin      = true,
+                label       = 'Next maneuver',
+                short_label = 'Maneuver',
+                right       = core.format_time(mr, fmt),
+                frac        = fill_frac(mr, total, mode),
+                dyn_end     = env.maneuver_recast_at or (now + mr),
+                dyn_total   = total,
+                dyn_mode    = mode,
+                color       = colors.maneuver_cd,
+                thin        = true,
             };
         end
-        local ov_rows = env.overload_rows;
-        if (ov_rows ~= nil) then
-            for i = 1, #ov_rows do
-                man_rows[#man_rows + 1] = ov_rows[i];
-            end
+    end
+    local ov_rows = env.overload_rows;
+    if (ov_rows ~= nil) then
+        for i = 1, #ov_rows do
+            man_rows[#man_rows + 1] = ov_rows[i];
         end
-        if (env.unpowered_text ~= nil) then
-            man_rows[#man_rows + 1] = {
-                label = env.unpowered_text, short_label = env.unpowered_short, right = '', frac = 0,
-                color = colors.warn, dim = true, thin = true, note = true,
-            };
-        end
+    end
+    if (env.unpowered_text ~= nil) then
+        man_rows[#man_rows + 1] = {
+            label = env.unpowered_text, short_label = env.unpowered_short, right = '', frac = 0,
+            color = colors.warn, dim = true, thin = true, note = true,
+        };
     end
 
     -- Automaton abilities ------------------------------------------------------------------------
@@ -1444,7 +1480,7 @@ function core.build_view(state, cfg, now, env)
             if (s.active and rem > 0) then
                 ja_rows[#ja_rows + 1] = {
                     label     = (def.key == 'repair' and env.repair_label) or def.name,
-                    short_label = core.short_name(def.name),
+                    short_label = (def.key == 'repair' and env.repair_short) or core.short_name(def.name),
                     right     = core.format_time(rem, fmt),
                     frac      = fill_frac(rem, s.total, mode),
                     dyn_end   = s.ends,
@@ -1461,12 +1497,11 @@ function core.build_view(state, cfg, now, env)
     table.sort(ja_rows, by_sortv);
     if (env.deactivate_hint) then
         ja_rows[#ja_rows + 1] = {
-            label = 'Full HP: Deactivate now resets Activate', short_label = 'Deact. resets Activate',
+            label = 'Full HP: Deactivating now resets Activate', short_label = 'Deactivating resets Activate',
             right = '', frac = 0, color = colors.ready, dim = true, thin = true, note = true,
         };
     end
 
-    -- Order sections ------------------------------------------------------------------------------
     -- Automaton HP / MP -------------------------------------------------------------------------
     local sec_pet = { key = 'automaton', rows = {} };
     local ac = cfg.automaton;
@@ -1540,7 +1575,7 @@ function core.demo_view(cfg, now)
     else
         man_rows = man_items;
     end
-    man_rows[#man_rows + 1] = { label = (cfg.maneuvers.style ~= 'bars') and 'Maneuver' or 'Next maneuver', right = core.format_time(4, fmt), frac = fill_frac(4, 10, mode), color = colors.maneuver_cd, thin = true };
+    man_rows[#man_rows + 1] = { label = 'Next maneuver', short_label = 'Maneuver', right = core.format_time(4, fmt), frac = fill_frac(4, 10, mode), color = colors.maneuver_cd, thin = true };
     if (cfg.overload ~= nil and cfg.overload.enabled) then
         man_rows[#man_rows + 1] = { label = 'Overload Fire ~12%', right = 'next ~32%', frac = 12 / 50, color = colors.overload_mid or colors.warn };
         man_rows[#man_rows + 1] = { label = 'Overload Light ~4%', right = 'next ~24%', frac = 4 / 50, color = colors.overload_mid or colors.warn };
@@ -1561,7 +1596,8 @@ function core.demo_view(cfg, now)
     if (cfg.automaton ~= nil and cfg.automaton.show_mp) then
         pet.rows[#pet.rows + 1] = { label = 'Automaton MP', right = '41%', frac = 0.41, color = colors.pet_mp, thin = true };
     end
-    local view = { header = cfg.hud.show_header and 'Automaton (preview)' or nil, sections = {}, count = 0, demo = true };
+    -- Says what these bars are, so nobody takes them for real timers on the first run.
+    local view = { header = cfg.hud.show_header and 'Automaton (preview)' or 'Sample bars (/pupt lock)', sections = {}, count = 0, demo = true };
     order_sections(view, cfg, { automaton = pet, maneuvers = man, abilities = abil, recasts = rec });
     for _, sec in ipairs(view.sections) do
         view.count = view.count + #sec.rows;
