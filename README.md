@@ -1,4 +1,4 @@
-# PupTimers — Puppetmaster timers for HorizonXI (Ashita v4)
+# PupTimers — Puppetmaster/Puppet timer & general addon for HorizonXI (Ashita v4)
 
 A small, movable, resizable timer window for Puppetmaster:
 
